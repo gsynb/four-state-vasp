@@ -4,6 +4,10 @@
 
 This is a Codex / Claude Code skill for VASP four-state magnetic-interaction workflows. It analyzes magnetic-neighbor shells from POSCAR files, generates VASP calculation trees for Jani, Jiso, SIA, biquadratic, and Kitaev interactions, and postprocesses finished jobs into meV-scale interaction parameters.
 
+## Contributors / 贡献者
+
+- [@gsynb](https://github.com/gsynb) - project owner; provided the scientific workflow requirements, reference-script provenance, and validation targets.
+
 ## 功能概览
 
 - `neighbors`: 给定 POSCAR 后，列出 10 A 或指定 cutoff 内的所有磁性原子近邻，按壳层给出代表 pair，并提示周期边界和扩包风险。
@@ -33,15 +37,17 @@ This is a Codex / Claude Code skill for VASP four-state magnetic-interaction wor
 ```text
 four-state-vasp/
 ├── SKILL.md
+├── CONTRIBUTORS.md
 ├── agents/
 │   └── openai.yaml
 ├── references/
-│   └── methods.md
+│   ├── methods.md
+│   └── bibliography.bib
 └── scripts/
     └── four_state_vasp.py
 ```
 
-`SKILL.md` 是 agent 入口说明；`scripts/four_state_vasp.py` 是实际生成和后处理脚本；`references/methods.md` 记录公式、状态定义和旧脚本来源。
+`SKILL.md` 是 agent 入口说明；`scripts/four_state_vasp.py` 是实际生成和后处理脚本；`references/methods.md` 记录公式、状态定义和旧脚本来源；`references/bibliography.bib` 提供可复制的文献引用。
 
 ## 安装到 Codex
 
@@ -453,3 +459,11 @@ Always inspect `pair_indexing.tsv`, `sia_target.tsv`, and `metadata.json` after 
 - `prepare --kind kitaev` directly computes the selected `J_gamma_gamma` projection. For a more complete Kitaev anisotropy estimate, run full `jani` first and then `kitaev-report`.
 - The methods and state formulas are documented in `references/methods.md`.
 
+## Literature / 文献引用
+
+If you publish results generated with this workflow, cite the papers that match the calculation. BibTeX entries are provided in `references/bibliography.bib`.
+
+- Four-state / spin-lattice energy mapping: H. Xiang, E. Kan, S.-H. Wei, M.-H. Whangbo, and X. G. Gong, Phys. Rev. B 84, 224429 (2011), DOI: [10.1103/PhysRevB.84.224429](https://doi.org/10.1103/PhysRevB.84.224429).
+- Energy-mapping review: H. Xiang, C. Lee, H.-J. Koo, X. G. Gong, and M.-H. Whangbo, Dalton Trans. 42, 823-853 (2013), DOI: [10.1039/C2DT31662E](https://doi.org/10.1039/C2DT31662E).
+- Generic four-state mapping reference: D. Sabani, C. Bacaksiz, and M. V. Milosevic, Phys. Rev. B 102, 014457 (2020), DOI: [10.1103/PhysRevB.102.014457](https://doi.org/10.1103/PhysRevB.102.014457).
+- Kitaev model/local-axis context: A. Kitaev, Ann. Phys. 321, 2-111 (2006), DOI: [10.1016/j.aop.2005.10.005](https://doi.org/10.1016/j.aop.2005.10.005).

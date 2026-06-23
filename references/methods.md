@@ -12,6 +12,15 @@ The skill consolidates logic from these user reference locations:
 
 In the Codex desktop workspace these paths usually correspond to `X:\cri2\...` and `X:\cri2hse_4state\...`.
 
+## Suggested Citations
+
+If results from this workflow are used in a manuscript, cite the method papers that match the calculation. BibTeX entries are collected in `bibliography.bib`.
+
+- Four-state / spin-lattice energy mapping: Xiang et al., Phys. Rev. B 84, 224429 (2011), DOI `10.1103/PhysRevB.84.224429`.
+- Energy-mapping analysis review: Xiang et al., Dalton Trans. 42, 823-853 (2013), DOI `10.1039/C2DT31662E`.
+- Generic four-state exchange mapping: Sabani et al., Phys. Rev. B 102, 014457 (2020), DOI `10.1103/PhysRevB.102.014457`.
+- Kitaev local-axis model context: Kitaev, Ann. Phys. 321, 2-111 (2006), DOI `10.1016/j.aop.2005.10.005`.
+
 ## Jani
 
 Components:
