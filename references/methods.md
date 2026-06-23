@@ -31,7 +31,11 @@ H = + S_i^T J S_j
 
 Use `--hamiltonian-sign minus` for the opposite coefficient sign convention. The generated metadata records the chosen convention, the spin convention, and the actual energy denominator used for every component.
 
-By default spin directions are unit vectors. With `--spin-convention spin_S --spin-length-S S`, bilinear terms are divided by `S^2` and biquadratic terms by `S^4`. If the selected periodic pair represents multiple equivalent bonds within `--bond-distance-tol`, the denominator also includes that bond multiplicity. This matters in small supercells and for boundary-crossing pairs.
+By default spin directions are unit vectors. With `--spin-convention spin_S --spin-length-S S`, bilinear terms are divided by `S^2` and biquadratic terms by `S^4`.
+
+For two-site calculations, the four-state constraints select POSCAR atom indices, not a single abstract periodic bond image. If the selected pair has multiple equal-distance periodic images within `--bond-distance-tol`, the calculated energy difference is a translation sum over those images. The library therefore rejects `bond_multiplicity > 1` by default. `--pair-image-shift` is only geometry/reporting metadata and does not isolate an interaction in the Hamiltonian. Use a larger supercell for publication calculations, or pass `--allow-periodic-bond-sum` only when you deliberately want the summed periodic coupling; no multiplicity division is applied.
+
+Only the default VASP `SAXIS = 0 0 1` is supported. Non-default `SAXIS` rotates the spinor basis relative to Cartesian `MAGMOM`/`M_CONSTR` vectors, and this library currently does not perform that conversion.
 
 ## Jani
 
@@ -58,7 +62,7 @@ Formula:
 Jab_meV = prefactor * (E1 - E2 - E3 + E4) * 1000 / denominator
 ```
 
-For the default unit-vector convention, `denominator = 4 * bond_multiplicity`. For `--hamiltonian-sign minus`, `prefactor = -1`; otherwise `prefactor = +1`.
+For the default unit-vector convention, `denominator = 4` for a unique explicit pair. With `--spin-convention spin_S`, this is additionally scaled by `S^2`. For `--hamiltonian-sign minus`, `prefactor = -1`; otherwise `prefactor = +1`.
 
 ## Jiso
 
@@ -79,7 +83,7 @@ Formula:
 Jaa_meV = prefactor * (E_upup - E_updn - E_dnup + E_dndn) * 1000 / denominator
 ```
 
-For the default unit-vector convention, `denominator = 4 * bond_multiplicity`.
+For the default unit-vector convention, `denominator = 4` for a unique explicit pair. With `--spin-convention spin_S`, this is additionally scaled by `S^2`.
 
 ## SIA
 
@@ -134,7 +138,13 @@ J_meV = prefactor * (E1 - E2) * 1000 / J_denominator
 Biquadratic_B_meV = prefactor * (E1 + E2 - E3 - E4) * 1000 / B_denominator
 ```
 
-For the default unit-vector convention, `J_denominator = 2 * bond_multiplicity` and `B_denominator = bond_multiplicity`.
+For the default unit-vector convention, `J_denominator = 2` and `B_denominator = 1` for a unique explicit pair. With `--spin-convention spin_S`, `J_denominator` is additionally scaled by `S^2` and `B_denominator` by `S^4`.
+
+## Constraint Diagnostics
+
+`postprocess.py` writes `results/constraint_diagnostics.tsv` in addition to `final_summary.txt`. The table records each state's final energy, parsed penalty energy `E_p` when present, target-site `M_int`/`MW_int` vectors when present, target-angle deviation, lambda diagnostics, and `constraint_pass`.
+
+By default strict postprocessing refuses to write final interaction values if a known penalty or target-angle check fails. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV` and `FOUR_STATE_MAX_TARGET_ANGLE_DEG`; set `FOUR_STATE_STRICT_CONSTRAINTS=0` only for manual debugging. Missing diagnostics are reported in the table/messages because VASP output formatting differs by version and build.
 
 ## Indexing Caution
 
@@ -183,19 +193,20 @@ The direct result is:
 J_gamma_gamma_meV = prefactor * (E_pp - E_pm - E_mp + E_mm) * 1000 / denominator
 ```
 
-For the default unit-vector convention, `denominator = 4 * bond_multiplicity`.
+For the default unit-vector convention, `denominator = 4` for a unique explicit pair. With `--spin-convention spin_S`, this is additionally scaled by `S^2`.
 
-To estimate the Kitaev anisotropy from a full anisotropic exchange tensor, first run `jani`, then run `kitaev-report --jani-root <jani-root>`. If `final_summary.txt` contains multiple bracketed stage blocks, pass `--stage` explicitly so the report does not silently select the wrong PBE/HSE stage. The report rotates the global J matrix into a two-site Kitaev frame, with rows in the site-`i` basis and columns in the site-`j` basis. It reports:
+To estimate the Kitaev anisotropy from a full anisotropic exchange tensor, first run `jani`, then run `kitaev-report --jani-root <jani-root>`. If `final_summary.txt` contains multiple bracketed stage blocks, pass `--stage` explicitly so the report does not silently select the wrong PBE/HSE stage. The report rotates the global J matrix into a single common bond frame for physical scalar decomposition, and also writes site-dependent local-gauge matrices for diagnostics:
 
 ```text
-kitaev_J_meV rows_i=(x,y,z) cols_j=(x,y,z)
-local_J_meV rows_i=(alpha,beta,gamma) cols_j=(alpha,beta,gamma)
-J_trace_iso_meV = trace(J_local) / 3
-K_gamma_minus_alpha_beta_avg_meV = J_gamma_gamma - (J_alpha_alpha + J_beta_beta) / 2
-traceless_gamma_anisotropy_meV = J_gamma_gamma - J_trace_iso
-Gamma_alpha_beta_meV
-Gamma_prime_avg_meV
-DMI_alpha_meV, DMI_beta_meV, DMI_gamma_meV
+common_J_meV rows=(alpha,beta,gamma) cols=(alpha,beta,gamma)
+local_gauge_J_meV rows_i=(alpha,beta,gamma) cols_j=(alpha,beta,gamma)
+kitaev_gauge_J_meV rows_i=(x,y,z) cols_j=(x,y,z)
+physical_J_trace_iso_meV = trace(J_common) / 3
+physical_K_gamma_minus_alpha_beta_avg_meV = J_gamma_gamma - (J_alpha_alpha + J_beta_beta) / 2
+physical_traceless_gamma_anisotropy_meV = J_gamma_gamma - physical_J_trace_iso
+physical_Gamma_alpha_beta_meV
+physical_Gamma_prime_avg_meV
+physical_DMI_alpha_meV, physical_DMI_beta_meV, physical_DMI_gamma_meV
 ```
 
-Use `K_gamma_minus_alpha_beta_avg_meV` when the convention is to compare the gamma component against the average of the other two local diagonal components. The DMI values are extracted from the antisymmetric part of the two-site local tensor.
+Use `physical_K_gamma_minus_alpha_beta_avg_meV` when the convention is to compare the gamma component against the average of the other two common-frame diagonal components. The DMI values are extracted from the antisymmetric part of the common-frame tensor. Do not decompose `local_gauge_J_meV` as physical K/Gamma/DMI when the two sites use different local frames; it is useful for checking axis matching but is not a common physical basis.

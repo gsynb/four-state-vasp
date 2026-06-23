@@ -272,25 +272,62 @@ def nearest_image_delta(
 ) -> tuple[tuple[float, float, float], tuple[int, int, int]]:
     raw = vec_sub(frac_j, frac_i)
     center = tuple(-nearest_int(x) for x in raw)
+    best_shift, best_frac, best_distance, best_tie = find_nearest_shift_in_box(
+        raw,
+        lattice,
+        [
+            (center[axis] - max(0, search_radius), center[axis] + max(0, search_radius))
+            for axis in range(3)
+        ],
+    )
+    if best_shift is None or best_frac is None:
+        raise ValueError("Could not determine nearest periodic image")
+
+    heights = lattice_heights(lattice)
+    if any(height <= 1e-12 for height in heights):
+        raise ValueError("Cannot determine nearest periodic image for a singular lattice")
+    eps = 1e-10
+    bounds: list[tuple[int, int]] = []
+    for axis, height in enumerate(heights):
+        limit = best_distance / height + eps
+        low = math.ceil(-raw[axis] - limit - eps)
+        high = math.floor(-raw[axis] + limit + eps)
+        bounds.append((low, high))
+
+    strict_shift, strict_frac, strict_distance, strict_tie = find_nearest_shift_in_box(raw, lattice, bounds)
+    if strict_shift is not None and strict_frac is not None:
+        best_shift, best_frac, best_distance, best_tie = strict_shift, strict_frac, strict_distance, strict_tie
+    if best_shift is None or best_frac is None:
+        raise ValueError("Could not determine nearest periodic image")
+    return best_frac, best_shift
+
+
+def find_nearest_shift_in_box(
+    raw_frac_delta: tuple[float, float, float],
+    lattice: list[tuple[float, float, float]],
+    bounds: list[tuple[int, int]],
+) -> tuple[tuple[int, int, int] | None, tuple[float, float, float] | None, float, tuple[int, int, int, int]]:
     best_shift: tuple[int, int, int] | None = None
     best_frac: tuple[float, float, float] | None = None
     best_distance = float("inf")
-    best_tie = (0, 0, 0, 0)
-    for dx in range(-search_radius, search_radius + 1):
-        for dy in range(-search_radius, search_radius + 1):
-            for dz in range(-search_radius, search_radius + 1):
-                shift = (center[0] + dx, center[1] + dy, center[2] + dz)
-                disp_frac = (raw[0] + shift[0], raw[1] + shift[1], raw[2] + shift[2])
+    best_tie = (10**9, 10**9, 10**9, 10**9)
+    for tx in range(bounds[0][0], bounds[0][1] + 1):
+        for ty in range(bounds[1][0], bounds[1][1] + 1):
+            for tz in range(bounds[2][0], bounds[2][1] + 1):
+                shift = (tx, ty, tz)
+                disp_frac = (
+                    raw_frac_delta[0] + tx,
+                    raw_frac_delta[1] + ty,
+                    raw_frac_delta[2] + tz,
+                )
                 distance = vec_norm(frac_to_cart(disp_frac, lattice))
-                tie = (abs(shift[0]) + abs(shift[1]) + abs(shift[2]), abs(shift[0]), abs(shift[1]), abs(shift[2]))
+                tie = (abs(tx) + abs(ty) + abs(tz), abs(tx), abs(ty), abs(tz))
                 if distance < best_distance - 1e-10 or (abs(distance - best_distance) <= 1e-10 and tie < best_tie):
                     best_shift = shift
                     best_frac = disp_frac
                     best_distance = distance
                     best_tie = tie
-    if best_shift is None or best_frac is None:
-        raise ValueError("Could not determine nearest periodic image")
-    return best_frac, best_shift
+    return best_shift, best_frac, best_distance, best_tie
 
 
 def lattice_heights(lattice: list[tuple[float, float, float]]) -> list[float]:
@@ -490,6 +527,43 @@ def pair_bond_context(info: PoscarInfo, pair: PairInfo, args: argparse.Namespace
     )
 
 
+def validate_pair_bond_context(kind: str, pair: PairInfo, bond: PairBondContext, args: argparse.Namespace) -> None:
+    if bond.multiplicity <= 1:
+        return
+    if getattr(args, "allow_periodic_bond_sum", False):
+        print(
+            f"[WARN] {kind} {pair.label}: POSCAR atom pair has {bond.multiplicity} equal-distance periodic images. "
+            "The extracted value is the sum over these periodic translations; no multiplicity division is applied.",
+            file=sys.stderr,
+        )
+        return
+    shifts = ", ".join(format_shift(shift) for shift in bond.equivalent_shifts)
+    raise ValueError(
+        f"{kind} {pair.label} is not a unique explicit pair: {bond.multiplicity} periodic images are within "
+        f"--bond-distance-tol at {bond.distance:.6f} A ({shifts}). Four-state MAGMOM/M_CONSTR selects POSCAR "
+        "atom indices, not a specific image shift, so the energy maps to a sum over periodic translations. "
+        "Build a larger supercell with a unique explicit target pair, or rerun with --allow-periodic-bond-sum "
+        "only for exploratory summed couplings."
+    )
+
+
+def bond_formula_metadata(bond: PairBondContext, args: argparse.Namespace) -> dict[str, object]:
+    if bond.multiplicity > 1 and getattr(args, "allow_periodic_bond_sum", False):
+        note = (
+            "Selected POSCAR atom pair has multiple equal-distance periodic images. "
+            "Four-state extraction reports their translation sum; denominator is not divided by multiplicity."
+        )
+    else:
+        note = "Selected POSCAR atom pair is unique within --bond-distance-tol."
+    return {
+        "bond_multiplicity": bond.multiplicity,
+        "pair_image_shift": bond.image_shift,
+        "equivalent_pair_shifts": bond.equivalent_shifts,
+        "pair_distance_A": bond.distance,
+        "pair_extraction_note": note,
+    }
+
+
 def spin_scale(args: argparse.Namespace, power: int) -> float:
     if getattr(args, "spin_convention", "unit_vector") == "unit_vector":
         return 1.0
@@ -509,9 +583,9 @@ def energy_denominator(
     spin_power: int,
     bond_multiplicity: int = 1,
 ) -> float:
-    if bond_multiplicity < 1:
-        raise ValueError("bond multiplicity must be >= 1")
-    return base_denominator * float(bond_multiplicity) * spin_scale(args, spin_power)
+    if bond_multiplicity != 1:
+        raise ValueError("periodic bond multiplicity is not a valid denominator factor")
+    return base_denominator * spin_scale(args, spin_power)
 
 
 def sia_energy_denominator(component: str) -> float:
@@ -1280,6 +1354,20 @@ def rotate_tensor_to_frame(
     )
 
 
+def common_kitaev_basis(frame: KitaevFrame) -> list[tuple[float, float, float]]:
+    return [frame.local_x, frame.local_y, frame.gamma_axis]
+
+
+def kitaev_axis_basis(frame: KitaevFrame) -> list[tuple[float, float, float]]:
+    axis_map = {label: axis for label, axis in frame.kitaev_axes}
+    return [axis_map[label] for label in KITAEV_AXIS_LABELS]
+
+
+def kitaev_axis_basis_j(frame: KitaevFrame) -> list[tuple[float, float, float]]:
+    axis_map = {label: axis for label, axis in frame.kitaev_axes_j}
+    return [axis_map[label] for label in KITAEV_AXIS_LABELS]
+
+
 def symmetric_matrix(matrix: list[list[float]]) -> list[list[float]]:
     return [[0.5 * (matrix[i][j] + matrix[j][i]) for j in range(3)] for i in range(3)]
 
@@ -1290,6 +1378,41 @@ def antisymmetric_dmi(matrix: list[list[float]]) -> tuple[float, float, float]:
         0.5 * (matrix[2][0] - matrix[0][2]),
         0.5 * (matrix[0][1] - matrix[1][0]),
     )
+
+
+def decompose_common_exchange(matrix: list[list[float]]) -> dict[str, float]:
+    symmetric = symmetric_matrix(matrix)
+    dmi = antisymmetric_dmi(matrix)
+    trace_iso = sum(symmetric[i][i] for i in range(3)) / 3.0
+    j_ab_avg = 0.5 * (symmetric[0][0] + symmetric[1][1])
+    return {
+        "J_trace_iso_meV": trace_iso,
+        "J_alpha_beta_avg_meV": j_ab_avg,
+        "J_gamma_gamma_meV": symmetric[2][2],
+        "traceless_gamma_anisotropy_meV": symmetric[2][2] - trace_iso,
+        "K_gamma_minus_alpha_beta_avg_meV": symmetric[2][2] - j_ab_avg,
+        "Gamma_alpha_beta_meV": symmetric[0][1],
+        "Gamma_prime_avg_meV": 0.5 * (symmetric[0][2] + symmetric[1][2]),
+        "Gamma_prime_split_meV": 0.5 * (symmetric[0][2] - symmetric[1][2]),
+        "alpha_beta_diag_split_meV": 0.5 * (symmetric[0][0] - symmetric[1][1]),
+        "DMI_alpha_meV": dmi[0],
+        "DMI_beta_meV": dmi[1],
+        "DMI_gamma_meV": dmi[2],
+    }
+
+
+def kitaev_exchange_matrices(
+    global_matrix: list[list[float]],
+    frame: KitaevFrame,
+) -> tuple[list[list[float]], list[list[float]], list[list[float]]]:
+    common_matrix = rotate_tensor_to_basis(global_matrix, common_kitaev_basis(frame))
+    local_gauge_matrix = rotate_tensor_to_frame(global_matrix, frame)
+    kitaev_gauge_matrix = rotate_tensor_between_bases(
+        global_matrix,
+        kitaev_axis_basis(frame),
+        kitaev_axis_basis_j(frame),
+    )
+    return common_matrix, local_gauge_matrix, kitaev_gauge_matrix
 
 
 def unique_summary_stages(summary: Path) -> list[str]:
@@ -1365,45 +1488,33 @@ def kitaev_report(args: argparse.Namespace) -> None:
     pairs = parse_pairs(args.pair, args.index_mode, mag, info.natoms)
     if len(pairs) != 1:
         raise ValueError("kitaev-report expects exactly one pair")
+    report_bond = pair_bond_context(info, pairs[0], args)
+    validate_pair_bond_context("kitaev-report", pairs[0], report_bond, args)
     frame = detect_kitaev_frame(info, mag, pairs[0], args)
     lines = ["Kitaev local-frame report", *frame_rows(frame, info)]
+    if report_bond.multiplicity > 1:
+        lines.append("periodic_bond_sum_warning\tJani tensor is a POSCAR-pair translation sum; no multiplicity division was applied")
     if args.jani_root:
         global_matrix, selected_stage = parse_jani_summary(Path(args.jani_root), frame.pair.label, args.stage)
-        axis_map_j = {label: axis for label, axis in frame.kitaev_axes_j}
-        kitaev_matrix = rotate_tensor_between_bases(
-            global_matrix,
-            [axis for _, axis in frame.kitaev_axes],
-            [axis_map_j[label] for label in KITAEV_AXIS_LABELS],
-        )
-        local_matrix = rotate_tensor_to_frame(global_matrix, frame)
-        symmetric_local = symmetric_matrix(local_matrix)
-        dmi = antisymmetric_dmi(local_matrix)
-        trace_iso = sum(symmetric_local[i][i] for i in range(3)) / 3.0
-        j_ab_avg = 0.5 * (symmetric_local[0][0] + symmetric_local[1][1])
-        k_minus_trace = symmetric_local[2][2] - trace_iso
-        k_minus_ab = symmetric_local[2][2] - j_ab_avg
-        gamma = symmetric_local[0][1]
-        gamma_prime_avg = 0.5 * (symmetric_local[0][2] + symmetric_local[1][2])
-        gamma_prime_split = 0.5 * (symmetric_local[0][2] - symmetric_local[1][2])
-        alpha_beta_diag_split = 0.5 * (symmetric_local[0][0] - symmetric_local[1][1])
+        common_matrix, local_gauge_matrix, kitaev_gauge_matrix = kitaev_exchange_matrices(global_matrix, frame)
+        symmetric_common = symmetric_matrix(common_matrix)
+        physical = decompose_common_exchange(common_matrix)
         lines.extend(matrix_lines("global_J_meV", global_matrix))
-        lines.extend(matrix_lines("kitaev_J_meV rows_i=(x,y,z) cols_j=(x,y,z)", kitaev_matrix))
-        lines.extend(matrix_lines("local_J_meV rows_i=(alpha,beta,gamma) cols_j=(alpha,beta,gamma)", local_matrix))
-        lines.extend(matrix_lines("local_symmetric_J_meV", symmetric_local))
+        lines.extend(matrix_lines("common_J_meV rows=(alpha,beta,gamma) cols=(alpha,beta,gamma)", common_matrix))
+        lines.extend(matrix_lines("common_symmetric_J_meV", symmetric_common))
+        lines.extend(
+            matrix_lines(
+                "local_gauge_J_meV rows_i=(alpha,beta,gamma) cols_j=(alpha,beta,gamma)",
+                local_gauge_matrix,
+            )
+        )
+        lines.extend(matrix_lines("kitaev_gauge_J_meV rows_i=(x,y,z) cols_j=(x,y,z)", kitaev_gauge_matrix))
         if selected_stage:
             lines.append(f"jani_stage\t{selected_stage}")
-        lines.append(f"J_trace_iso_meV\t{trace_iso:.8f}")
-        lines.append(f"J_alpha_beta_avg_meV\t{j_ab_avg:.8f}")
-        lines.append(f"J_gamma_gamma_meV\t{symmetric_local[2][2]:.8f}")
-        lines.append(f"traceless_gamma_anisotropy_meV\t{k_minus_trace:.8f}")
-        lines.append(f"K_gamma_minus_alpha_beta_avg_meV\t{k_minus_ab:.8f}")
-        lines.append(f"Gamma_alpha_beta_meV\t{gamma:.8f}")
-        lines.append(f"Gamma_prime_avg_meV\t{gamma_prime_avg:.8f}")
-        lines.append(f"Gamma_prime_split_meV\t{gamma_prime_split:.8f}")
-        lines.append(f"alpha_beta_diag_split_meV\t{alpha_beta_diag_split:.8f}")
-        lines.append(f"DMI_alpha_meV\t{dmi[0]:.8f}")
-        lines.append(f"DMI_beta_meV\t{dmi[1]:.8f}")
-        lines.append(f"DMI_gamma_meV\t{dmi[2]:.8f}")
+        lines.append("physical_decomposition_frame\tcommon alpha,beta,gamma bond frame from site-i octahedral axes")
+        lines.append("local_gauge_note\tlocal_gauge/kitaev_gauge matrices use different left/right site frames and are diagnostics, not physical DMI/K/Gamma decompositions")
+        for key, value in physical.items():
+            lines.append(f"physical_{key}\t{value:.8f}")
     text = "\n".join(lines) + "\n"
     print(text, end="")
     if args.out:
@@ -1506,6 +1617,29 @@ def parse_numeric_values(raw: str) -> list[float]:
     return values
 
 
+def saxis_is_default(raw_values: list[str] | list[float]) -> bool:
+    try:
+        values = [float(str(value).replace("D", "E").replace("d", "e")) for value in raw_values]
+    except ValueError:
+        return False
+    return (
+        len(values) == 3
+        and abs(values[0]) <= 1e-12
+        and abs(values[1]) <= 1e-12
+        and abs(values[2] - 1.0) <= 1e-12
+    )
+
+
+def validate_cli_saxis(args: argparse.Namespace) -> None:
+    if not getattr(args, "saxis", None):
+        return
+    if not saxis_is_default(args.saxis):
+        raise ValueError(
+            "Only the default SAXIS = 0 0 1 is currently supported. Non-default SAXIS changes the spinor basis, "
+            "while generated M_CONSTR vectors are Cartesian; remove --saxis or set --saxis 0 0 1."
+        )
+
+
 def incar_bool(raw: str) -> bool | None:
     token = raw.strip().split()[0].strip(".").upper() if raw.strip() else ""
     if token in {"TRUE", "T", "1", "YES"}:
@@ -1526,6 +1660,10 @@ def validate_template_incar(incar: Path, info: PoscarInfo, kind: str, label: str
         errors.append(f"missing positive RWIGS values for all {len(info.elements)} POSCAR element(s)")
     if tags.get("ISPIN", "").strip().split()[:1] == ["2"]:
         errors.append("ISPIN=2 is incompatible with the generated noncollinear setup; remove ISPIN from the template")
+    if "SAXIS" in tags and not saxis_is_default(parse_numeric_values(tags["SAXIS"])):
+        errors.append(
+            "non-default SAXIS is not supported; generated MAGMOM/M_CONSTR vectors assume the default SAXIS = 0 0 1"
+        )
     if kind in {"jani", "sia", "kitaev"} and incar_bool(tags.get("LSORBIT", "")) is not True:
         errors.append(f"{kind} requires LSORBIT=.TRUE. for SOC-driven anisotropic terms")
     if kind == "biqua" and incar_bool(tags.get("LSORBIT", "")) is True:
@@ -1671,7 +1809,8 @@ def generate_jani(
     background_axis = args.background_axis or "z"
     for pair in pairs:
         bond = pair_bond_context(info, pair, args)
-        denominator = energy_denominator(args, 4.0, 2, bond.multiplicity)
+        validate_pair_bond_context("jani", pair, bond, args)
+        denominator = energy_denominator(args, 4.0, 2)
         prefix = f"{pair.label}/" if nest_pairs else ""
         for comp in JANI_COMPONENTS:
             states = []
@@ -1693,10 +1832,8 @@ def generate_jani(
                     "formula": f"prefactor * (E1 - E2 - E3 + E4) * 1000 / {denominator:g}",
                     "energy_denominator": denominator,
                     "hamiltonian_prefactor": hamiltonian_prefactor(args),
-                    "bond_multiplicity": bond.multiplicity,
-                    "pair_image_shift": bond.image_shift,
-                    "equivalent_pair_shifts": bond.equivalent_shifts,
-                    "pair_distance_A": bond.distance,
+                    "target_global_indices_1based": [pair.global_i + 1, pair.global_j + 1],
+                    **bond_formula_metadata(bond, args),
                 }
             )
     return jobs, formulas
@@ -1720,7 +1857,8 @@ def generate_jiso(
     }
     for pair in pairs:
         bond = pair_bond_context(info, pair, args)
-        denominator = energy_denominator(args, 4.0, 2, bond.multiplicity)
+        validate_pair_bond_context("jiso", pair, bond, args)
+        denominator = energy_denominator(args, 4.0, 2)
         states = []
         for spin in JISO_SPINS:
             ui, uj = spin_units[spin]
@@ -1738,16 +1876,14 @@ def generate_jiso(
                 "quantity": f"J{args.pair_axis}{args.pair_axis}_meV",
                 "states": states,
                 "state_labels": JISO_SPINS,
-                "formula": f"prefactor * (E_upup - E_updn - E_dnup + E_dndn) * 1000 / {denominator:g}",
-                "energy_denominator": denominator,
-                "hamiltonian_prefactor": hamiltonian_prefactor(args),
-                "bond_multiplicity": bond.multiplicity,
-                "pair_image_shift": bond.image_shift,
-                "equivalent_pair_shifts": bond.equivalent_shifts,
-                "pair_distance_A": bond.distance,
-                "note": "Axis-resolved four-state exchange along --pair-axis; use Jani trace for a rotational isotropic average.",
-            }
-        )
+                    "formula": f"prefactor * (E_upup - E_updn - E_dnup + E_dndn) * 1000 / {denominator:g}",
+                    "energy_denominator": denominator,
+                    "hamiltonian_prefactor": hamiltonian_prefactor(args),
+                    "target_global_indices_1based": [pair.global_i + 1, pair.global_j + 1],
+                    **bond_formula_metadata(bond, args),
+                    "note": "Axis-resolved four-state exchange along --pair-axis; use Jani trace for a rotational isotropic average.",
+                }
+            )
     return jobs, formulas
 
 
@@ -1766,7 +1902,8 @@ def generate_kitaev(
     nest_pairs = len(pairs) > 1
     for pair in pairs:
         bond = pair_bond_context(info, pair, args)
-        denominator = energy_denominator(args, 4.0, 2, bond.multiplicity)
+        validate_pair_bond_context("kitaev", pair, bond, args)
+        denominator = energy_denominator(args, 4.0, 2)
         frame = detect_kitaev_frame(info, mag, pair, args)
         frames.append(frame)
         spin_units = {
@@ -1796,10 +1933,8 @@ def generate_kitaev(
                 "formula": f"prefactor * (E_pp - E_pm - E_mp + E_mm) * 1000 / {denominator:g}",
                 "energy_denominator": denominator,
                 "hamiltonian_prefactor": hamiltonian_prefactor(args),
-                "bond_multiplicity": bond.multiplicity,
-                "pair_image_shift": bond.image_shift,
-                "equivalent_pair_shifts": bond.equivalent_shifts,
-                "pair_distance_A": bond.distance,
+                "target_global_indices_1based": [pair.global_i + 1, pair.global_j + 1],
+                **bond_formula_metadata(bond, args),
                 "note": "Projection along the octahedral gamma axis. Rotate full Jani with kitaev-report for K minus isotropic part.",
             }
         )
@@ -1843,6 +1978,7 @@ def generate_sia(
                 ),
                 "energy_denominator": energy_denominator(args, sia_energy_denominator(comp), 2),
                 "hamiltonian_prefactor": hamiltonian_prefactor(args),
+                "target_global_indices_1based": [target_global + 1],
             }
         )
     (out_root / "sia_target.tsv").write_text(
@@ -1863,8 +1999,9 @@ def generate_biqua(
         raise ValueError("biquadratic generation expects exactly one pair")
     pair = pairs[0]
     bond = pair_bond_context(info, pair, args)
-    j_denominator = energy_denominator(args, 2.0, 2, bond.multiplicity)
-    b_denominator = energy_denominator(args, 1.0, 4, bond.multiplicity)
+    validate_pair_bond_context("biqua", pair, bond, args)
+    j_denominator = energy_denominator(args, 2.0, 2)
+    b_denominator = energy_denominator(args, 1.0, 4)
     jobs: list[dict[str, str]] = []
     states = []
     background_axis = args.background_axis or "z"
@@ -1897,10 +2034,8 @@ def generate_biqua(
             "j_energy_denominator": j_denominator,
             "b_energy_denominator": b_denominator,
             "hamiltonian_prefactor": hamiltonian_prefactor(args),
-            "bond_multiplicity": bond.multiplicity,
-            "pair_image_shift": bond.image_shift,
-            "equivalent_pair_shifts": bond.equivalent_shifts,
-            "pair_distance_A": bond.distance,
+            "target_global_indices_1based": [pair.global_i + 1, pair.global_j + 1],
+            **bond_formula_metadata(bond, args),
         }
     ]
 
@@ -2058,14 +2193,62 @@ POSTPROCESS_PY = r'''#!/usr/bin/env python3
 from __future__ import annotations
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
 
-ENERGY_RE = re.compile(r"E0=\s*([-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?)")
-TOTEN_RE = re.compile(r"free\s+energy\s+TOTEN\s+=\s+([-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?)")
+FLOAT_RE_TEXT = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?"
+ENERGY_RE = re.compile(r"E0=\s*(" + FLOAT_RE_TEXT + r")")
+TOTEN_RE = re.compile(r"free\s+energy\s+TOTEN\s+=\s+(" + FLOAT_RE_TEXT + r")")
+PENALTY_RE = re.compile(r"\bE_p\s*=\s*(" + FLOAT_RE_TEXT + r")")
+LAMBDA_RE = re.compile(r"\blambda\s*=\s*(" + FLOAT_RE_TEXT + r")", re.I)
+LAMBDA_MW_PERP_RE = re.compile(r"lambda\s*\*\s*MW_perp\s*=\s*(" + FLOAT_RE_TEXT + r")", re.I)
+MW_INT_RE = re.compile(r"\bMW_int\s*=\s*([^\n\r]+)")
+M_INT_RE = re.compile(r"\bM_int\s*=\s*([^\n\r]+)")
+MAX_PENALTY_EV = float(os.environ.get("FOUR_STATE_MAX_PENALTY_EV", "1e-4"))
+MAX_TARGET_ANGLE_DEG = float(os.environ.get("FOUR_STATE_MAX_TARGET_ANGLE_DEG", "5.0"))
+STRICT_CONSTRAINTS = os.environ.get("FOUR_STATE_STRICT_CONSTRAINTS", "1").strip().lower() not in {"0", "false", "no"}
 
-def extract_energy(path: Path, suffix: str) -> float:
+def parse_float(raw: str) -> float:
+    return float(raw.replace("D", "E").replace("d", "e"))
+
+def parse_floats(raw: str) -> list[float]:
+    return [parse_float(match) for match in re.findall(FLOAT_RE_TEXT, raw)]
+
+def vector_norm(vec) -> float:
+    return math.sqrt(sum(value * value for value in vec))
+
+def vector_angle_degrees(a, b) -> float | None:
+    na = vector_norm(a)
+    nb = vector_norm(b)
+    if na <= 1e-12 or nb <= 1e-12:
+        return None
+    dot = sum(a[idx] * b[idx] for idx in range(3)) / (na * nb)
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(math.acos(dot))
+
+def as_vectors(values: list[float]) -> list[tuple[float, float, float]]:
+    n = len(values) // 3
+    return [tuple(values[3 * idx : 3 * idx + 3]) for idx in range(n)]
+
+def strip_incar_comment(line: str) -> str:
+    return re.split(r"[#!]", line, maxsplit=1)[0].strip()
+
+def read_incar_tag(path: Path, tag: str) -> str | None:
+    if not path.exists():
+        return None
+    tag_upper = tag.upper()
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = strip_incar_comment(raw)
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip().upper() == tag_upper:
+            return value.strip()
+    return None
+
+def read_text_candidates(path: Path, suffix: str) -> list[tuple[Path, str]]:
     candidates = [
         path / f"output.{suffix}",
         path / f"OSZICAR.{suffix}",
@@ -2074,27 +2257,120 @@ def extract_energy(path: Path, suffix: str) -> float:
         path / "OSZICAR",
         path / "OUTCAR",
     ]
+    texts = []
     for cand in candidates:
-        if not cand.exists() or cand.stat().st_size == 0:
-            continue
-        text = cand.read_text(errors="ignore")
+        if cand.exists() and cand.stat().st_size > 0:
+            texts.append((cand, cand.read_text(errors="ignore")))
+    return texts
+
+def last_regex_float(texts: list[tuple[Path, str]], pattern: re.Pattern[str]) -> float | None:
+    for _, text in reversed(texts):
+        matches = pattern.findall(text)
+        if matches:
+            return parse_float(matches[-1])
+    return None
+
+def last_vector_record(texts: list[tuple[Path, str]], pattern: re.Pattern[str]) -> list[tuple[float, float, float]]:
+    for _, text in reversed(texts):
+        matches = pattern.findall(text)
+        if matches:
+            vectors = as_vectors(parse_floats(matches[-1]))
+            if vectors:
+                return vectors
+    return []
+
+def select_vectors(vectors: list[tuple[float, float, float]], indices_1based: list[int]) -> list[tuple[float, float, float]]:
+    if not vectors or not indices_1based:
+        return []
+    if max(indices_1based) <= len(vectors):
+        return [vectors[idx - 1] for idx in indices_1based]
+    return vectors[: len(indices_1based)]
+
+def format_vector_list(vectors: list[tuple[float, float, float]]) -> str:
+    if not vectors:
+        return "NA"
+    return ";".join("(" + ",".join(f"{value:.8f}" for value in vec) + ")" for vec in vectors)
+
+def extract_energy(path: Path, suffix: str) -> float:
+    for cand, text in read_text_candidates(path, suffix):
         matches = ENERGY_RE.findall(text)
         if matches:
-            return float(matches[-1])
+            return parse_float(matches[-1])
         matches = TOTEN_RE.findall(text)
         if matches:
-            return float(matches[-1])
+            return parse_float(matches[-1])
     raise FileNotFoundError(f"No energy found in {path} for suffix {suffix}")
+
+def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state_label: str, stage_name: str) -> dict:
+    path = base / rel
+    texts = read_text_candidates(path, suffix)
+    energy = extract_energy(path, suffix)
+    penalty_ep = last_regex_float(texts, PENALTY_RE)
+    lambda_value = last_regex_float(texts, LAMBDA_RE)
+    if lambda_value is None:
+        incar_lambda = read_incar_tag(path / "INCAR", "LAMBDA")
+        values = parse_floats(incar_lambda or "")
+        lambda_value = max(values) if values else None
+    lambda_mw_perp = last_regex_float(texts, LAMBDA_MW_PERP_RE)
+    mw_vectors = last_vector_record(texts, MW_INT_RE)
+    m_vectors = last_vector_record(texts, M_INT_RE)
+    target_vectors = as_vectors(parse_floats(read_incar_tag(path / "INCAR", "M_CONSTR") or ""))
+    target_indices = [int(idx) for idx in formula.get("target_global_indices_1based", [])]
+    target_mw = select_vectors(mw_vectors, target_indices)
+    target_m = select_vectors(m_vectors, target_indices)
+    target_ref = select_vectors(target_vectors, target_indices)
+    angles = []
+    for target, measured in zip(target_ref, target_m):
+        angle = vector_angle_degrees(target, measured)
+        if angle is not None:
+            angles.append(min(angle, 180.0 - angle))
+    max_angle = max(angles) if angles else None
+    messages = []
+    passed = True
+    if penalty_ep is None:
+        messages.append("E_p_missing")
+    elif abs(penalty_ep) > MAX_PENALTY_EV:
+        passed = False
+        messages.append(f"E_p>{MAX_PENALTY_EV:g}")
+    if max_angle is None:
+        messages.append("target_angle_unavailable")
+    elif max_angle > MAX_TARGET_ANGLE_DEG:
+        passed = False
+        messages.append(f"angle>{MAX_TARGET_ANGLE_DEG:g}")
+    return {
+        "stage": stage_name,
+        "formula_label": formula["label"],
+        "state_label": state_label,
+        "relpath": rel,
+        "energy_eV": energy,
+        "penalty_Ep_eV": penalty_ep,
+        "max_target_angle_deg": max_angle,
+        "target_site_MW_int": format_vector_list(target_mw),
+        "target_site_M_int": format_vector_list(target_m),
+        "lambda": lambda_value,
+        "lambda_MW_perp": lambda_mw_perp,
+        "constraint_pass": passed,
+        "messages": ";".join(messages) if messages else "ok",
+    }
 
 def calc_four_state(es, denominator, prefactor):
     return prefactor * (es[0] - es[1] - es[2] + es[3]) * 1000.0 / denominator
 
-def collect_stage(root: Path, metadata: dict, stage: dict) -> str:
+def collect_stage(root: Path, metadata: dict, stage: dict) -> tuple[str, list[dict], list[dict]]:
     base = root / stage["base"] if stage["base"] else root
     suffix = stage["suffix"]
     lines = [f"# stage {stage['name']}", "# label quantity E1 E2 E3 E4 value_meV"]
+    diagnostics = []
+    failures = []
     for formula in metadata["formulas"]:
-        energies = [extract_energy(base / rel, suffix) for rel in formula["states"]]
+        state_labels = formula.get("state_labels", [f"E{idx + 1}" for idx in range(len(formula["states"]))])
+        state_records = [
+            extract_state_record(base, rel, suffix, formula, label, stage["name"])
+            for rel, label in zip(formula["states"], state_labels)
+        ]
+        diagnostics.extend(state_records)
+        failures.extend([record for record in state_records if not record["constraint_pass"]])
+        energies = [record["energy_eV"] for record in state_records]
         prefactor = float(formula.get("hamiltonian_prefactor", 1.0))
         if formula["kind"] == "biquadratic":
             j_denominator = float(formula.get("j_energy_denominator", 2.0))
@@ -2116,7 +2392,35 @@ def collect_stage(root: Path, metadata: dict, stage: dict) -> str:
                 f"{formula['label']} {formula['quantity']} {energies[0]:.12f} {energies[1]:.12f} "
                 f"{energies[2]:.12f} {energies[3]:.12f} {value:.8f}"
             )
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", diagnostics, failures
+
+def tsv_value(value) -> str:
+    if value is None:
+        return "NA"
+    if isinstance(value, float):
+        return f"{value:.12g}"
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+def write_constraint_diagnostics(path: Path, rows: list[dict]) -> None:
+    headers = [
+        "stage",
+        "formula_label",
+        "state_label",
+        "relpath",
+        "energy_eV",
+        "penalty_Ep_eV",
+        "max_target_angle_deg",
+        "target_site_MW_int",
+        "target_site_M_int",
+        "lambda",
+        "lambda_MW_perp",
+        "constraint_pass",
+        "messages",
+    ]
+    lines = ["\t".join(headers)]
+    for row in rows:
+        lines.append("\t".join(tsv_value(row.get(header)) for header in headers))
+    path.write_text("\n".join(lines) + "\n")
 
 def main():
     root = Path.cwd()
@@ -2124,13 +2428,27 @@ def main():
     results = root / "results"
     results.mkdir(exist_ok=True)
     summary = []
+    all_diagnostics = []
+    all_failures = []
     for stage in metadata["stages"]:
-        text = collect_stage(root, metadata, stage)
+        text, diagnostics, failures = collect_stage(root, metadata, stage)
+        all_diagnostics.extend(diagnostics)
+        all_failures.extend(failures)
         out = results / f"{stage['name']}_{metadata['kind']}_energy.dat"
         out.write_text(text)
         summary.append(f"[{stage['name']}]\n{text}")
+    write_constraint_diagnostics(results / "constraint_diagnostics.tsv", all_diagnostics)
+    if STRICT_CONSTRAINTS and all_failures:
+        details = ", ".join(
+            f"{row['stage']}:{row['relpath']}({row['messages']})" for row in all_failures[:8]
+        )
+        raise RuntimeError(
+            "Constraint diagnostics failed; refusing final interaction output. "
+            f"See {results / 'constraint_diagnostics.tsv'}. First failures: {details}"
+        )
     (root / "final_summary.txt").write_text("\n".join(summary))
     print(f"Wrote {root / 'final_summary.txt'}")
+    print(f"Wrote {results / 'constraint_diagnostics.tsv'}")
 
 if __name__ == "__main__":
     main()
@@ -2204,12 +2522,13 @@ Files:
 - state_jobs.tsv: relative state directories and suggested Slurm job names.
 - run_state.sh: runs one state. Use: sbatch run_state.sh <relpath>
 - submit_all.sh: submits every row in state_jobs.tsv.
-- postprocess.sh/postprocess.py: collect energies after jobs finish.
+- postprocess.sh/postprocess.py: collect energies and constraint diagnostics after jobs finish.
 - metadata.json: machine-readable formulas and directory map.
 
 Energy formulas:
-- Each formula in metadata.json records the actual denominator, Hamiltonian prefactor, spin convention, and bond multiplicity.
-- SIA diagonal differences use denominator 2; off-diagonal SIA and two-site four-state terms use denominator 4 before spin/multiplicity scaling.
+- Each formula in metadata.json records the actual denominator, Hamiltonian prefactor, spin convention, and pair metadata.
+- SIA diagonal differences use denominator 2; off-diagonal SIA and two-site four-state terms use denominator 4 before spin scaling.
+- Two-site calculations require a unique explicit POSCAR pair by default. If --allow-periodic-bond-sum was used, the reported value is a summed coupling over periodic translations and is not divided by multiplicity.
 - Jiso output is the selected axis component Jaa from --pair-axis, not a tensor trace average.
 
 Indexing:
@@ -2227,6 +2546,7 @@ def prepare(args: argparse.Namespace) -> None:
     out_root = Path(args.out).resolve()
     if out_root.exists() and any(out_root.iterdir()) and not args.force:
         raise FileExistsError(f"Output directory is not empty: {out_root}. Use --force to write into it.")
+    validate_cli_saxis(args)
     validate_input_templates(info, args)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -2381,12 +2701,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="unit_vector reports coefficients for normalized spin directions; spin_S divides by --spin-length-S powers.",
     )
     prep.add_argument("--spin-length-S", type=float, default=1.0, help="Spin length used when --spin-convention spin_S")
-    prep.add_argument("--pair-image-shift", nargs=3, type=int, help="Use this periodic image shift for atom j instead of nearest image")
+    prep.add_argument(
+        "--pair-image-shift",
+        nargs=3,
+        type=int,
+        help="Use this image shift only for geometry/reporting; the four-state energy still sums all periodic images of the POSCAR atom pair",
+    )
     prep.add_argument(
         "--bond-distance-tol",
         type=float,
         default=0.02,
-        help="Distance tolerance in Angstrom for counting equivalent periodic bonds in denominator",
+        help="Distance tolerance in Angstrom for detecting non-unique equal-distance periodic bonds",
+    )
+    prep.add_argument(
+        "--allow-periodic-bond-sum",
+        action="store_true",
+        help="Allow non-unique POSCAR atom pairs and report the summed coupling over periodic images without multiplicity division",
     )
     prep.add_argument(
         "--background-axis",
@@ -2407,7 +2737,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow nearest-ligand fallback if two shared ligands are not found within --metal-ligand-cutoff",
     )
     prep.add_argument("--workflow", choices=["single", "pbe-hse"], default="single")
-    prep.add_argument("--saxis", nargs=3, help="Optional SAXIS values, e.g. --saxis 0 0 1")
+    prep.add_argument("--saxis", nargs=3, help="Optional SAXIS values; only the default 0 0 1 is currently supported")
     prep.add_argument("--no-stage-tag-edits", action="store_true", help="Do not add PBE/HSE stage INCAR tag edits")
     prep.add_argument("--force", action="store_true", help="Allow writing into a non-empty output directory")
     prep.set_defaults(func=prepare)
@@ -2443,8 +2773,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow nearest-ligand fallback if two shared ligands are not found within --metal-ligand-cutoff",
     )
-    krep.add_argument("--pair-image-shift", nargs=3, type=int, help="Use this periodic image shift for atom j instead of nearest image")
+    krep.add_argument(
+        "--pair-image-shift",
+        nargs=3,
+        type=int,
+        help="Use this image shift only for geometry/reporting; tensor extraction still refers to POSCAR atom indices",
+    )
     krep.add_argument("--bond-distance-tol", type=float, default=0.02)
+    krep.add_argument(
+        "--allow-periodic-bond-sum",
+        action="store_true",
+        help="Allow non-unique POSCAR atom pairs and label tensors as periodic-image sums",
+    )
     krep.add_argument("--jani-root", help="Root of a completed Jani calculation with final_summary.txt")
     krep.add_argument("--stage", help="Stage name in final_summary.txt, e.g. single or hse_no_u")
     krep.add_argument("--out", help="Optional report file")

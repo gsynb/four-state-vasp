@@ -13,8 +13,8 @@ This is a Codex / Claude Code skill for VASP four-state magnetic-interaction wor
 - `prepare --kind sia`: 为指定磁性原子生成单离子各向异性 `SIA` 的四态法目录。
 - `prepare --kind biqua`: 为指定 pair 生成 biquadratic 相互作用目录。
 - `prepare --kind kitaev`: 根据共享配体和八面体方向识别 Kitaev `x/y/z` 轴，选择当前键的 `gamma` 轴并生成四态目录。
-- `kitaev-report`: 将已完成的 Jani 张量旋转到两端 Kitaev 局域坐标，输出 `K_gamma_minus_alpha_beta_avg_meV`、`Gamma`、`Gamma'` 和 DMI 等指标。
-- `collect`: 收集 VASP 完成后的能量并写出 `final_summary.txt`。
+- `kitaev-report`: 将已完成的 Jani 张量同时旋转到公共 bond frame 和两端局域 gauge frame；物理 `K/Gamma/DMI` 只从公共 frame 提取，局域 gauge 矩阵仅作诊断。
+- `collect`: 收集 VASP 完成后的能量，写出 `final_summary.txt` 和约束质量表 `results/constraint_diagnostics.tsv`。
 
 ## Feature Summary
 
@@ -25,8 +25,8 @@ This is a Codex / Claude Code skill for VASP four-state magnetic-interaction wor
 - `prepare --kind sia`: generate single-ion anisotropy calculations.
 - `prepare --kind biqua`: generate biquadratic interaction calculations.
 - `prepare --kind kitaev`: detect octahedral Kitaev axes from shared ligands and generate the selected `gamma` projection.
-- `kitaev-report`: rotate a completed Jani tensor into the two-site matched Kitaev local frame and report `K`, `Gamma`, `Gamma'`, and DMI components.
-- `collect`: extract final VASP energies and write `final_summary.txt`.
+- `kitaev-report`: rotate a completed Jani tensor into both a common bond frame and site-dependent local-gauge frames; physical `K/Gamma/DMI` are extracted only from the common frame.
+- `collect`: extract final VASP energies and write `final_summary.txt` plus `results/constraint_diagnostics.tsv`.
 
 ## 目录结构
 
@@ -170,6 +170,14 @@ or ask naturally and let Claude Code load the skill when relevant.
 
 Do not commit licensed or large VASP files such as `POTCAR`, `WAVECAR`, or `CHGCAR` to a public repository.
 
+## 重要安全规则 / Important Safety Rules
+
+- 对 `jani`、`jiso`、`kitaev` 和 `biqua`，默认要求所选 POSCAR 原子对在当前超胞中是唯一显式 pair。如果同一个 POSCAR 原子对存在多条等距周期 image，四态法能量对应的是所有这些周期平移耦合的和，而不是某一条指定 image。
+- `--pair-image-shift` 只用于几何识别和报告，不能在能量上隔离某一条周期键。
+- 程序默认拒绝 `bond_multiplicity > 1` 的 pair。仅在探索性检查或你明确知道要拟合“周期键总和”时使用 `--allow-periodic-bond-sum`；此时分母仍不会除以 multiplicity。
+- 只支持默认 `SAXIS = 0 0 1`。非默认 `SAXIS` 会改变 VASP spinor basis，而本库生成的 `M_CONSTR` 是 Cartesian 方向；当前不会自动做两者转换。
+- 后处理会写出 `results/constraint_diagnostics.tsv`，包含 `E_p`、`M_int/MW_int`（若 VASP 输出中存在）、目标角偏差、`lambda` 和 `constraint_pass`。可用环境变量 `FOUR_STATE_MAX_PENALTY_EV`、`FOUR_STATE_MAX_TARGET_ANGLE_DEG` 和 `FOUR_STATE_STRICT_CONSTRAINTS=0` 调整阈值或关闭严格失败。
+
 ## 命令行使用
 
 下面示例假设已经在仓库根目录：
@@ -258,7 +266,7 @@ python3 scripts/four_state_vasp.py prepare \
   --workflow pbe-hse
 ```
 
-输出 `Axy Axz Ayz Ayy_minus_Axx Azz_minus_Axx`。对角差分项的分母为 2，非对角项为 4，实际分母和 spin/multiplicity 约定写在 `metadata.json`。
+输出 `Axy Axz Ayz Ayy_minus_Axx Azz_minus_Axx`。对角差分项的分母为 2，非对角项为 4；实际分母、spin 约定和目标原子编号写在 `metadata.json`。
 
 ### 6. Biquadratic
 
@@ -330,7 +338,7 @@ bash postprocess.sh
 python3 scripts/four_state_vasp.py collect --root pair_14_15_jani
 ```
 
-最终结果写入输出目录下的 `final_summary.txt`，能量单位为 meV。
+最终结果写入输出目录下的 `final_summary.txt`，能量单位为 meV；约束质量写入 `results/constraint_diagnostics.tsv`。若严格约束检查失败，后处理会拒绝写出最终相互作用结果。
 
 ## CLI Quick Start
 
@@ -451,7 +459,7 @@ Always inspect `pair_indexing.tsv`, `sia_target.tsv`, and `metadata.json` after 
 1. 对 pair 先做完整 `jani`。
 2. VASP 完成后 `collect`。
 3. 运行 `kitaev-report --jani-root <jani-root>`。
-4. 优先查看 `K_gamma_minus_alpha_beta_avg_meV`；同时检查 `traceless_gamma_anisotropy_meV`、`Gamma_alpha_beta_meV`、`Gamma_prime_avg_meV` 和 DMI 分量。
+4. 优先查看 `physical_K_gamma_minus_alpha_beta_avg_meV`；同时检查 `physical_traceless_gamma_anisotropy_meV`、`physical_Gamma_alpha_beta_meV`、`physical_Gamma_prime_avg_meV` 和 `physical_DMI_*` 分量。`local_gauge_J_meV` / `kitaev_gauge_J_meV` 只用于诊断两端局域坐标匹配，不用于物理 K/Gamma/DMI 分解。
 
 ## Notes
 
@@ -459,6 +467,9 @@ Always inspect `pair_indexing.tsv`, `sia_target.tsv`, and `metadata.json` after 
 - `--workflow pbe-hse` creates both PBE+U preconvergence and HSE no-U directories.
 - `kitaev-report` requires `--stage` when a `final_summary.txt` contains multiple stages such as `pbe_pre` and `hse_no_u`.
 - `prepare --kind kitaev` directly computes the selected `J_gamma_gamma` projection. For a more complete Kitaev anisotropy estimate, run full `jani` first and then `kitaev-report`.
+- `jani`/`jiso`/`kitaev`/`biqua` reject non-unique periodic pair images by default. `--allow-periodic-bond-sum` reports the summed coupling over periodic translations and does not divide by multiplicity.
+- `kitaev-report` writes physical decompositions with the `physical_` prefix from a common bond frame; local-gauge matrices are diagnostics only.
+- `collect` writes `results/constraint_diagnostics.tsv`; inspect it before trusting small anisotropy or Kitaev values.
 - The methods and state formulas are documented in `references/methods.md`.
 
 ## Literature / 文献引用
