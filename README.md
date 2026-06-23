@@ -4,10 +4,6 @@
 
 This is a Codex / Claude Code skill for VASP four-state magnetic-interaction workflows. It analyzes magnetic-neighbor shells from POSCAR files, generates VASP calculation trees for Jani, Jiso, SIA, biquadratic, and Kitaev interactions, and postprocesses finished jobs into meV-scale interaction parameters.
 
-## Contributors / 贡献者
-
-- [@gsynb](https://github.com/gsynb) - project owner; provided the scientific workflow requirements, reference-script provenance, and validation targets.
-
 ## 功能概览
 
 - `neighbors`: 给定 POSCAR 后，列出 10 A 或指定 cutoff 内的所有磁性原子近邻，按壳层给出代表 pair，并提示周期边界和扩包风险。
