@@ -79,6 +79,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse \
   --saxis 0 0 1
 ```
@@ -96,6 +97,7 @@ python3 scripts/four_state_vasp.py prepare \
   --moment 6 \
   --background-axis x \
   --pair-axis z \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -110,6 +112,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --atom 14 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -124,6 +127,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -139,6 +143,7 @@ python3 scripts/four_state_vasp.py prepare \
   --ligand-elements I \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -169,7 +174,7 @@ The generator writes:
 - `state_jobs.tsv`: one state per row, with relative path and suggested Slurm job name.
 - `run_state.sh`: runs one state; it supports both single-stage and PBE+U -> HSE no-U workflows.
 - `submit_all.sh`: submits all states.
-- `postprocess.sh` and `postprocess.py`: collect final energies, write `results/constraint_diagnostics.tsv`, and write `final_summary.txt` only when strict constraint diagnostics pass.
+- `postprocess.sh` and `postprocess.py`: collect final energies, write `results/constraint_diagnostics.tsv` and `results/formula_diagnostics.tsv`, and write `final_summary.txt` only when strict state-level and formula-level constraint diagnostics pass.
 - `metadata.json`: directory map, formulas, stages, and POSCAR/magnetic-index metadata.
 - For `kitaev`, `kitaev_frames.tsv` records the two-site matched `x/y/z` Kitaev axes, selected `gamma` axis, auxiliary `alpha/beta` axes, pair image shift, shared ligands, octahedral ligand references, axis overlaps, axis-consistency angles, and bond-axis dot products.
 
@@ -186,9 +191,9 @@ For `--workflow pbe-hse`, each state has both `pbe/<relpath>` and `<relpath>`. `
 - If two cutoff-shared ligands are not found, stop and ask the user to check `--ligand-elements`/`--metal-ligand-cutoff`; use `--allow-kitaev-ligand-fallback` only for exploratory geometry checks.
 - Use `--kitaev-no-component-permutation` when reproducing older `generated_materials` runs that used a discrete row/sign match without Cartesian component permutation.
 - Direct `prepare --kind kitaev` gives `local_gauge_J_gamma_i_gamma_j_meV`, the `gamma_i^T J gamma_j` projection using site-i and site-j local `gamma` axes. For the physically useful Kitaev anisotropy, run full `jani` and then `kitaev-report`; inspect `physical_K_gamma_minus_alpha_beta_avg_meV`, `physical_traceless_gamma_anisotropy_meV`, `physical_Gamma_alpha_beta_meV`, `physical_Gamma_prime_avg_meV`, and `physical_DMI_*`. Treat `local_gauge_J_meV` and `kitaev_gauge_J_meV` as diagnostics only because their left/right bases differ.
-- `prepare` validates templates before writing state trees: positive `LAMBDA`, enough positive `RWIGS`, no `ISPIN=2`, and default `SAXIS = 0 0 1` only; `jani`/`sia`/`kitaev` require `LSORBIT=.TRUE.`, while `biqua` rejects `LSORBIT=.TRUE.`. It writes `I_CONSTRAINED_M=4` by default for sign-constrained production calculations and requires VASP >= 6.4.0 when `--vasp-version` is supplied.
+- `prepare` validates templates before writing state trees: positive `LAMBDA`, enough positive `RWIGS`, no `ISPIN=2`, and default `SAXIS = 0 0 1` only; `jani`/`sia`/`kitaev` require `LSORBIT=.TRUE.`, while `biqua` rejects `LSORBIT=.TRUE.`. It writes `I_CONSTRAINED_M=4` by default for sign-constrained production calculations, requires `--vasp-version >= 6.4.0` for that mode, and writes `ISYM = -1` unless overridden with `--isym`.
 - `prepare --kind jiso` reports the selected axis component `Jaa`, not the trace-average isotropic exchange.
 - Formula denominators are stored per entry in `metadata.json`; SIA diagonal differences use base denominator 2, off-diagonal SIA and two-site four-state terms use base denominator 4, then spin convention is applied. Never divide by periodic bond multiplicity: `jani`/`jiso`/`kitaev`/`biqua` reject non-unique POSCAR pair images by default, and `--allow-periodic-bond-sum` reports the summed coupling over periodic translations.
 - `bootstrap` only fills POTCAR-derived `RWIGS` by default; add `--ldau` only when the built-in example U values are intentionally desired and will be reviewed.
 - `kitaev-report --jani-root` must be given `--stage` when `final_summary.txt` contains more than one stage.
-- Energy unit in postprocessing: meV. Constraint diagnostics are written to `results/constraint_diagnostics.tsv`; `postprocess.py` parses VASP `ion MW_int M_int` and `ion lambda*MW_perp` tables, checks every nonzero `M_CONSTR` site with signed `MW_int` angles, and fails closed when strict data are missing. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV`, `FOUR_STATE_MAX_TARGET_ANGLE_DEG`, and `FOUR_STATE_STRICT_CONSTRAINTS=0`.
+- Energy unit in postprocessing: meV. State diagnostics are written to `results/constraint_diagnostics.tsv`; formula diagnostics are written to `results/formula_diagnostics.tsv`. `postprocess.py` parses VASP `ion MW_int M_int` and `ion lambda*MW_perp` tables, checks every nonzero `M_CONSTR` site with signed `MW_int` angles, verifies four-state `lambda`, `MW_int` norm, and penalty-energy combination consistency, and fails closed when strict data are missing. Strict failure removes stale `final_summary.txt` and prefixes generated `*_energy.dat` files with `INVALID_CONSTRAINT_DIAGNOSTICS`. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV`, `FOUR_STATE_MAX_TARGET_ANGLE_DEG`, `FOUR_STATE_MAX_LAMBDA_SPREAD`, `FOUR_STATE_MAX_MW_RELATIVE_SPREAD`, `FOUR_STATE_MAX_PENALTY_COMBINATION_MEV`, and `FOUR_STATE_STRICT_CONSTRAINTS=0`.

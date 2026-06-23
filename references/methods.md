@@ -146,9 +146,13 @@ For the default unit-vector convention, `J_denominator = 2` and `B_denominator =
 
 `MW_int` is the primary direction diagnostic because it is the smoothed integrated moment entering VASP's constrained-moment penalty functional. The angle check is signed: a measured moment along `-n` has a 180 degree error against target `+n` and fails.
 
-Strict postprocessing refuses to write final interaction values if any required constraint diagnostic is missing or fails: `E_p`, `MW_int`, `M_CONSTR`, target ion records, reported `lambda`, target sign, or angle threshold. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV` and `FOUR_STATE_MAX_TARGET_ANGLE_DEG`; set `FOUR_STATE_STRICT_CONSTRAINTS=0` only for manual debugging.
+`postprocess.py` also writes `results/formula_diagnostics.tsv`. For each four-state formula it checks that the reported `lambda` values are consistent, that each constrained ion's `MW_int` norm remains stable across the four states, and that the four-state penalty-energy combination `E_p1 - E_p2 - E_p3 + E_p4` is small enough not to contaminate the target energy difference.
 
-`prepare` writes `I_CONSTRAINED_M=4` by default so VASP constrains both direction and sign. This mode is available in VASP 6.4.0 and newer. If an older VASP must be used, set `--constraint-mode 1` explicitly and treat it as a compatibility mode: VASP constrains only the axis, while postprocessing still rejects any observed `MW_int` sign flip.
+Strict postprocessing refuses to write final interaction values if any required state or formula diagnostic is missing or fails: `E_p`, `MW_int`, `M_CONSTR`, target ion records, reported `lambda`, target sign, angle threshold, four-state `lambda` spread, `MW_int` norm spread, or penalty-energy combination. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV`, `FOUR_STATE_MAX_TARGET_ANGLE_DEG`, `FOUR_STATE_MAX_LAMBDA_SPREAD`, `FOUR_STATE_MAX_MW_RELATIVE_SPREAD`, and `FOUR_STATE_MAX_PENALTY_COMBINATION_MEV`; set `FOUR_STATE_STRICT_CONSTRAINTS=0` only for manual debugging. Strict failure removes any stale `final_summary.txt` and marks generated `*_energy.dat` files with `INVALID_CONSTRAINT_DIAGNOSTICS`.
+
+`prepare` writes `I_CONSTRAINED_M=4` by default so VASP constrains both direction and sign. This mode is available in VASP 6.4.0 and newer, so default mode 4 generation requires `--vasp-version >= 6.4.0`; postprocessing also records the runtime VASP version when it can parse it from output files. If an older VASP must be used, set `--constraint-mode 1` explicitly and treat it as a compatibility mode: VASP constrains only the axis, while postprocessing still rejects any observed `MW_int` sign flip.
+
+Generated INCAR files use `ISYM = -1` by default so different spin directions do not silently change symmetry reduction or irreducible k-point sets. Use `--isym` only for intentional reproduction runs after checking the energy-difference sensitivity.
 
 ## Indexing Caution
 

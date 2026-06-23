@@ -176,8 +176,9 @@ Do not commit licensed or large VASP files such as `POTCAR`, `WAVECAR`, or `CHGC
 - `--pair-image-shift` 只用于几何识别和报告，不能在能量上隔离某一条周期键。
 - 程序默认拒绝 `bond_multiplicity > 1` 的 pair。仅在探索性检查或你明确知道要拟合“周期键总和”时使用 `--allow-periodic-bond-sum`；此时分母仍不会除以 multiplicity。
 - 只支持默认 `SAXIS = 0 0 1`。非默认 `SAXIS` 会改变 VASP spinor basis，而本库生成的 `M_CONSTR` 是 Cartesian 方向；当前不会自动做两者转换。
-- 默认使用 `I_CONSTRAINED_M=4`，因为四态法需要区分 `+n` 和 `-n`；该模式要求 VASP >= 6.4.0。老版本可显式使用 `--constraint-mode 1`，但后处理仍会用有符号 `MW_int` 夹角检查，反号会失败。
-- 后处理会写出 `results/constraint_diagnostics.tsv`，解析真实 VASP `ion MW_int M_int` 和 `ion lambda*MW_perp` 表格，检查所有非零 `M_CONSTR` 原子的 `MW_int` 方向、符号、`E_p` 和 `lambda`。严格模式下缺少 `E_p`、`MW_int`、`M_CONSTR`、目标原子记录或 `lambda` 会拒绝写出最终结果。可用环境变量 `FOUR_STATE_MAX_PENALTY_EV`、`FOUR_STATE_MAX_TARGET_ANGLE_DEG` 和 `FOUR_STATE_STRICT_CONSTRAINTS=0` 调整阈值或关闭严格失败。
+- 默认使用 `I_CONSTRAINED_M=4`，因为四态法需要区分 `+n` 和 `-n`；该模式要求 VASP >= 6.4.0，因此 `prepare` 默认也要求写明 `--vasp-version 6.4.x`。老版本可显式使用 `--constraint-mode 1`，但后处理仍会用有符号 `MW_int` 夹角检查，反号会失败。
+- 生成的 INCAR 默认写入 `ISYM = -1`，避免不同自旋方向触发不同对称性/k 点集合；如需复现旧输入可显式传 `--isym <value>`，但发表级各向异性能量建议先做对称性关闭验证。
+- 后处理会写出 `results/constraint_diagnostics.tsv` 和 `results/formula_diagnostics.tsv`，解析真实 VASP `ion MW_int M_int` 和 `ion lambda*MW_perp` 表格，检查所有非零 `M_CONSTR` 原子的 `MW_int` 方向、符号、`E_p` 和 `lambda`，并检查四态 `lambda`、`MW_int` 模长与惩罚能组合项的一致性。严格模式下缺少 `E_p`、`MW_int`、`M_CONSTR`、目标原子记录或 `lambda` 会拒绝写出最终结果；失败时旧 `final_summary.txt` 会被删除，`*_energy.dat` 顶部会标记 `INVALID_CONSTRAINT_DIAGNOSTICS`。可用环境变量 `FOUR_STATE_MAX_PENALTY_EV`、`FOUR_STATE_MAX_TARGET_ANGLE_DEG`、`FOUR_STATE_MAX_LAMBDA_SPREAD`、`FOUR_STATE_MAX_MW_RELATIVE_SPREAD`、`FOUR_STATE_MAX_PENALTY_COMBINATION_MEV` 和 `FOUR_STATE_STRICT_CONSTRAINTS=0` 调整阈值或关闭严格失败。
 
 ## 命令行使用
 
@@ -229,6 +230,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse \
   --saxis 0 0 1
 ```
@@ -248,6 +250,7 @@ python3 scripts/four_state_vasp.py prepare \
   --moment 6 \
   --background-axis x \
   --pair-axis z \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -264,6 +267,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --atom 14 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -280,6 +284,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -295,6 +300,7 @@ python3 scripts/four_state_vasp.py prepare \
   --ligand-elements I \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -339,7 +345,7 @@ bash postprocess.sh
 python3 scripts/four_state_vasp.py collect --root pair_14_15_jani
 ```
 
-最终结果写入输出目录下的 `final_summary.txt`，能量单位为 meV；约束质量写入 `results/constraint_diagnostics.tsv`。若严格约束检查失败，后处理会拒绝写出最终相互作用结果。
+最终结果写入输出目录下的 `final_summary.txt`，能量单位为 meV；单态约束质量写入 `results/constraint_diagnostics.tsv`，四态组合质量写入 `results/formula_diagnostics.tsv`。若严格约束检查失败，后处理会删除旧 `final_summary.txt`，拒绝写出最终相互作用结果，并在对应 `*_energy.dat` 顶部标记 `INVALID_CONSTRAINT_DIAGNOSTICS`。
 
 ## CLI Quick Start
 
@@ -364,6 +370,7 @@ python3 scripts/four_state_vasp.py prepare \
   --magnetic-elements Cr \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -379,6 +386,7 @@ python3 scripts/four_state_vasp.py prepare \
   --ligand-elements I \
   --pair 14-15 \
   --moment 6 \
+  --vasp-version 6.4.0 \
   --workflow pbe-hse
 ```
 
@@ -470,8 +478,8 @@ Always inspect `pair_indexing.tsv`, `sia_target.tsv`, and `metadata.json` after 
 - `prepare --kind kitaev` directly computes `local_gauge_J_gamma_i_gamma_j_meV`, i.e. `gamma_i^T J gamma_j` using the two site-local axes. For a more complete Kitaev anisotropy estimate, run full `jani` first and then `kitaev-report`.
 - `jani`/`jiso`/`kitaev`/`biqua` reject non-unique periodic pair images by default. `--allow-periodic-bond-sum` reports the summed coupling over periodic translations and does not divide by multiplicity.
 - `kitaev-report` writes physical decompositions with the `physical_` prefix from a common bond frame; local-gauge matrices are diagnostics only.
-- `prepare` writes `I_CONSTRAINED_M=4` by default and records `constraint_mode` plus optional `--vasp-version` in `metadata.json`. Use VASP >= 6.4.0 for production sign-constrained four-state calculations.
-- `collect` writes `results/constraint_diagnostics.tsv`; it parses VASP-style `MW_int/M_int` and `lambda*MW_perp` tables, checks every nonzero `M_CONSTR` site with a signed `MW_int` angle, and fails closed in strict mode.
+- `prepare` writes `I_CONSTRAINED_M=4` by default and now requires `--vasp-version >= 6.4.0` for that mode. It also writes `ISYM = -1` by default; override with `--isym` only when deliberately reproducing a less conservative input.
+- `collect` writes `results/constraint_diagnostics.tsv` and `results/formula_diagnostics.tsv`; it parses VASP-style `MW_int/M_int` and `lambda*MW_perp` tables, checks every nonzero `M_CONSTR` site with a signed `MW_int` angle, verifies four-state lambda/MW-norm/penalty consistency, and fails closed in strict mode. On failure it removes stale `final_summary.txt` and marks `*_energy.dat` with `INVALID_CONSTRAINT_DIAGNOSTICS`.
 - The methods and state formulas are documented in `references/methods.md`.
 
 ## Literature / 文献引用

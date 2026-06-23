@@ -1678,12 +1678,18 @@ def validate_constraint_mode(args: argparse.Namespace) -> None:
     if mode not in {1, 2, 4}:
         raise ValueError("--constraint-mode must be one of 1, 2, or 4")
     parsed = version_tuple(getattr(args, "vasp_version", None))
-    if mode == 4 and parsed is not None and parsed < (6, 4, 0):
-        raise ValueError(
-            "--constraint-mode 4 requires VASP >= 6.4.0 because it constrains direction and sign. "
-            "Use a newer VASP for production four-state runs, or explicitly choose --constraint-mode 1/2 "
-            "and rely on strict signed MW_int diagnostics."
-        )
+    if mode == 4:
+        if parsed is None:
+            raise ValueError(
+                "--constraint-mode 4 requires --vasp-version >= 6.4.0 because this VASP mode constrains "
+                "direction and sign only in VASP 6.4.0 and newer."
+            )
+        if parsed < (6, 4, 0):
+            raise ValueError(
+                "--constraint-mode 4 requires VASP >= 6.4.0 because it constrains direction and sign. "
+                "Use a newer VASP for production four-state runs, or explicitly choose --constraint-mode 1/2 "
+                "and rely on strict signed MW_int diagnostics."
+            )
     if mode == 1:
         print(
             "[WARN] I_CONSTRAINED_M=1 constrains only the axis, not the +/- sign; "
@@ -1783,6 +1789,7 @@ def common_incar_tags(magmom: str, args: argparse.Namespace) -> dict[str, str | 
         "M_CONSTR": magmom,
         "LNONCOLLINEAR": ".TRUE.",
         "I_CONSTRAINED_M": str(int(getattr(args, "constraint_mode", 4))),
+        "ISYM": str(int(getattr(args, "isym", -1))),
         "ISPIN": None,
         "NSW": "0",
         "IBRION": "-1",
@@ -2261,10 +2268,14 @@ ENERGY_RE = re.compile(r"E0=\s*(" + FLOAT_RE_TEXT + r")")
 TOTEN_RE = re.compile(r"free\s+energy\s+TOTEN\s+=\s+(" + FLOAT_RE_TEXT + r")")
 PENALTY_RE = re.compile(r"\bE_p\s*=\s*(" + FLOAT_RE_TEXT + r")")
 LAMBDA_RE = re.compile(r"\blambda\s*=\s*(" + FLOAT_RE_TEXT + r")", re.I)
+VASP_VERSION_RE = re.compile(r"\bvasp\.?\s*(\d+(?:\.\d+){0,2})", re.I)
 ION_MW_HEADER_RE = re.compile(r"^\s*ion\s+MW_int\s+M_int\s*$", re.I)
 ION_LAMBDA_MW_PERP_HEADER_RE = re.compile(r"^\s*ion\s+lambda\s*\*\s*MW_perp\s*$", re.I)
 MAX_PENALTY_EV = float(os.environ.get("FOUR_STATE_MAX_PENALTY_EV", "1e-4"))
 MAX_TARGET_ANGLE_DEG = float(os.environ.get("FOUR_STATE_MAX_TARGET_ANGLE_DEG", "5.0"))
+MAX_LAMBDA_SPREAD = float(os.environ.get("FOUR_STATE_MAX_LAMBDA_SPREAD", "1e-8"))
+MAX_MW_RELATIVE_SPREAD = float(os.environ.get("FOUR_STATE_MAX_MW_RELATIVE_SPREAD", "0.05"))
+MAX_PENALTY_COMBINATION_MEV = float(os.environ.get("FOUR_STATE_MAX_PENALTY_COMBINATION_MEV", "0.1"))
 STRICT_CONSTRAINTS = os.environ.get("FOUR_STATE_STRICT_CONSTRAINTS", "1").strip().lower() not in {"0", "false", "no"}
 NONZERO_MCONSTR_TOL = 1e-8
 
@@ -2273,6 +2284,16 @@ def parse_float(raw: str) -> float:
 
 def parse_floats(raw: str) -> list[float]:
     return [parse_float(match) for match in re.findall(FLOAT_RE_TEXT, raw)]
+
+def version_tuple(raw: str | None) -> tuple[int, int, int] | None:
+    if not raw:
+        return None
+    nums = [int(match) for match in re.findall(r"\d+", str(raw))[:3]]
+    if not nums:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
 
 def vector_norm(vec) -> float:
     return math.sqrt(sum(value * value for value in vec))
@@ -2310,14 +2331,17 @@ def read_incar_tag(path: Path, tag: str) -> str | None:
     return None
 
 def read_text_candidates(path: Path, suffix: str) -> list[tuple[Path, str]]:
-    candidates = [
+    suffixed = [
         path / f"output.{suffix}",
         path / f"OSZICAR.{suffix}",
         path / f"OUTCAR.{suffix}",
+    ]
+    unsuffixed = [
         path / "output",
         path / "OSZICAR",
         path / "OUTCAR",
     ]
+    candidates = suffixed if any(cand.exists() and cand.stat().st_size > 0 for cand in suffixed) else unsuffixed
     texts = []
     for cand in candidates:
         if cand.exists() and cand.stat().st_size > 0:
@@ -2329,6 +2353,13 @@ def last_regex_float(texts: list[tuple[Path, str]], pattern: re.Pattern[str]) ->
         matches = pattern.findall(text)
         if matches:
             return parse_float(matches[-1])
+    return None
+
+def last_vasp_version(texts: list[tuple[Path, str]]) -> str | None:
+    for _, text in reversed(texts):
+        matches = VASP_VERSION_RE.findall(text)
+        if matches:
+            return matches[-1]
     return None
 
 def parse_ion_moment_tables(text: str) -> list[tuple[dict[int, tuple[float, float, float]], dict[int, tuple[float, float, float]]]]:
@@ -2414,8 +2445,8 @@ def max_norm(vectors: list[tuple[float, float, float]]) -> float | None:
         return None
     return max(vector_norm(vec) for vec in vectors)
 
-def extract_energy(path: Path, suffix: str) -> float:
-    for cand, text in read_text_candidates(path, suffix):
+def extract_energy_from_texts(texts: list[tuple[Path, str]], path: Path, suffix: str) -> float:
+    for cand, text in texts:
         matches = ENERGY_RE.findall(text)
         if matches:
             return parse_float(matches[-1])
@@ -2424,12 +2455,19 @@ def extract_energy(path: Path, suffix: str) -> float:
             return parse_float(matches[-1])
     raise FileNotFoundError(f"No energy found in {path} for suffix {suffix}")
 
+def extract_energy(path: Path, suffix: str) -> float:
+    return extract_energy_from_texts(read_text_candidates(path, suffix), path, suffix)
+
 def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state_label: str, stage_name: str, metadata: dict) -> dict:
     path = base / rel
     texts = read_text_candidates(path, suffix)
-    energy = extract_energy(path, suffix)
+    energy = extract_energy_from_texts(texts, path, suffix)
     penalty_ep = last_regex_float(texts, PENALTY_RE)
     reported_lambda = last_regex_float(texts, LAMBDA_RE)
+    actual_vasp_version = last_vasp_version(texts)
+    actual_vasp_tuple = version_tuple(actual_vasp_version)
+    declared_vasp_version = metadata.get("vasp_version")
+    declared_vasp_tuple = version_tuple(str(declared_vasp_version) if declared_vasp_version is not None else None)
     incar_lambda = read_incar_tag(path / "INCAR", "LAMBDA")
     incar_lambda_values = parse_floats(incar_lambda or "")
     lambda_value = reported_lambda if reported_lambda is not None else (max(incar_lambda_values) if incar_lambda_values else None)
@@ -2485,6 +2523,16 @@ def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state
     def note(message: str) -> None:
         messages.append(message)
 
+    constraint_mode = int(metadata.get("constraint_mode", 0) or 0)
+    if constraint_mode == 4:
+        if actual_vasp_tuple is not None and actual_vasp_tuple < (6, 4, 0):
+            fail("actual_vasp_version<6.4.0")
+        elif actual_vasp_tuple is None and declared_vasp_tuple is None:
+            fail("vasp_version_unknown_for_constraint_mode_4")
+        if declared_vasp_tuple is not None and declared_vasp_tuple < (6, 4, 0):
+            fail("declared_vasp_version<6.4.0")
+        if actual_vasp_tuple is not None and declared_vasp_tuple is not None and actual_vasp_tuple != declared_vasp_tuple:
+            note(f"vasp_version_mismatch_declared={declared_vasp_version}_actual={actual_vasp_version}")
     if penalty_ep is None:
         fail("E_p_missing")
     elif abs(penalty_ep) > MAX_PENALTY_EV:
@@ -2520,14 +2568,18 @@ def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state
         note("M_int_missing")
     if not lambda_mw_perp_table:
         note("lambda_MW_perp_missing")
-    if int(metadata.get("constraint_mode", 0) or 0) == 1:
+    if constraint_mode == 1:
         note("constraint_mode_1_axis_only")
+    mw_norms_by_index = {idx: vector_norm(mw_table[idx]) for idx in constrained_indices if idx in mw_table}
     return {
         "stage": stage_name,
         "formula_label": formula["label"],
         "state_label": state_label,
         "relpath": rel,
         "energy_eV": energy,
+        "snapshot_files": ",".join(path.name for path, _ in texts) if texts else "NA",
+        "vasp_version": actual_vasp_version,
+        "declared_vasp_version": declared_vasp_version,
         "constraint_mode": metadata.get("constraint_mode", "NA"),
         "penalty_Ep_eV": penalty_ep,
         "max_constrained_angle_deg": max_constrained_angle,
@@ -2545,17 +2597,93 @@ def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state
         "target_site_lambda_MW_perp": format_vector_list(target_lambda_mw_perp),
         "constraint_pass": passed,
         "messages": ";".join(messages) if messages else "ok",
+        "_lambda": lambda_value,
+        "_penalty_ep_eV": penalty_ep,
+        "_mw_norms_by_index": mw_norms_by_index,
     }
 
 def calc_four_state(es, denominator, prefactor):
     return prefactor * (es[0] - es[1] - es[2] + es[3]) * 1000.0 / denominator
 
-def collect_stage(root: Path, metadata: dict, stage: dict) -> tuple[str, list[dict], list[dict]]:
+def formula_constraint_diagnostics(stage_name: str, formula: dict, state_records: list[dict]) -> dict:
+    messages = []
+    passed = True
+
+    def fail(message: str) -> None:
+        nonlocal passed
+        passed = False
+        messages.append(message)
+
+    def note(message: str) -> None:
+        messages.append(message)
+
+    lambdas = [record.get("_lambda") for record in state_records if record.get("_lambda") is not None]
+    lambda_spread = None
+    if len(lambdas) == len(state_records) and lambdas:
+        lambda_spread = max(lambdas) - min(lambdas)
+        if lambda_spread > MAX_LAMBDA_SPREAD:
+            fail(f"lambda_spread>{MAX_LAMBDA_SPREAD:g}")
+    else:
+        fail("lambda_spread_unavailable")
+
+    penalties = [record.get("_penalty_ep_eV") for record in state_records if record.get("_penalty_ep_eV") is not None]
+    penalty_combo_meV = None
+    if len(penalties) >= 4:
+        penalty_combo_meV = (penalties[0] - penalties[1] - penalties[2] + penalties[3]) * 1000.0
+        if abs(penalty_combo_meV) > MAX_PENALTY_COMBINATION_MEV:
+            fail(f"penalty_four_state_combination>{MAX_PENALTY_COMBINATION_MEV:g}_meV")
+    else:
+        fail("penalty_four_state_combination_unavailable")
+
+    norm_groups: dict[int, list[float]] = {}
+    for record in state_records:
+        for ion, norm in record.get("_mw_norms_by_index", {}).items():
+            norm_groups.setdefault(int(ion), []).append(float(norm))
+    complete_groups = {ion: norms for ion, norms in norm_groups.items() if len(norms) == len(state_records)}
+    all_norms = [norm for norms in complete_groups.values() for norm in norms]
+    max_mw_norm = max(all_norms) if all_norms else None
+    min_mw_norm = min(all_norms) if all_norms else None
+    max_relative_spread = None
+    spread_ion = None
+    if complete_groups:
+        for ion, norms in complete_groups.items():
+            mean_norm = sum(norms) / len(norms)
+            if mean_norm <= 1e-12:
+                fail(f"MW_norm_zero_ion={ion}")
+                continue
+            rel_spread = (max(norms) - min(norms)) / mean_norm
+            if max_relative_spread is None or rel_spread > max_relative_spread:
+                max_relative_spread = rel_spread
+                spread_ion = ion
+        if max_relative_spread is not None and max_relative_spread > MAX_MW_RELATIVE_SPREAD:
+            fail(f"relative_MW_norm_spread>{MAX_MW_RELATIVE_SPREAD:g}_ion={spread_ion}")
+    else:
+        fail("MW_norm_spread_unavailable")
+
+    if not messages:
+        note("ok")
+    return {
+        "stage": stage_name,
+        "formula_label": formula["label"],
+        "quantity": formula.get("quantity", formula.get("kind", "NA")),
+        "lambda_spread": lambda_spread,
+        "max_MW_norm": max_mw_norm,
+        "min_MW_norm": min_mw_norm,
+        "relative_MW_norm_spread": max_relative_spread,
+        "MW_norm_spread_ion": spread_ion,
+        "penalty_four_state_combination_meV": penalty_combo_meV,
+        "formula_constraint_pass": passed,
+        "messages": ";".join(messages),
+    }
+
+def collect_stage(root: Path, metadata: dict, stage: dict) -> tuple[str, list[dict], list[dict], list[dict], list[dict]]:
     base = root / stage["base"] if stage["base"] else root
     suffix = stage["suffix"]
     lines = [f"# stage {stage['name']}", "# label quantity E1 E2 E3 E4 value_meV"]
     diagnostics = []
     failures = []
+    formula_diagnostics = []
+    formula_failures = []
     for formula in metadata["formulas"]:
         state_labels = formula.get("state_labels", [f"E{idx + 1}" for idx in range(len(formula["states"]))])
         state_records = [
@@ -2564,6 +2692,10 @@ def collect_stage(root: Path, metadata: dict, stage: dict) -> tuple[str, list[di
         ]
         diagnostics.extend(state_records)
         failures.extend([record for record in state_records if not record["constraint_pass"]])
+        formula_record = formula_constraint_diagnostics(stage["name"], formula, state_records)
+        formula_diagnostics.append(formula_record)
+        if not formula_record["formula_constraint_pass"]:
+            formula_failures.append(formula_record)
         energies = [record["energy_eV"] for record in state_records]
         prefactor = float(formula.get("hamiltonian_prefactor", 1.0))
         if formula["kind"] == "biquadratic":
@@ -2586,7 +2718,7 @@ def collect_stage(root: Path, metadata: dict, stage: dict) -> tuple[str, list[di
                 f"{formula['label']} {formula['quantity']} {energies[0]:.12f} {energies[1]:.12f} "
                 f"{energies[2]:.12f} {energies[3]:.12f} {value:.8f}"
             )
-    return "\n".join(lines) + "\n", diagnostics, failures
+    return "\n".join(lines) + "\n", diagnostics, failures, formula_diagnostics, formula_failures
 
 def tsv_value(value) -> str:
     if value is None:
@@ -2602,6 +2734,9 @@ def write_constraint_diagnostics(path: Path, rows: list[dict]) -> None:
         "state_label",
         "relpath",
         "energy_eV",
+        "snapshot_files",
+        "vasp_version",
+        "declared_vasp_version",
         "constraint_mode",
         "penalty_Ep_eV",
         "max_constrained_angle_deg",
@@ -2625,33 +2760,80 @@ def write_constraint_diagnostics(path: Path, rows: list[dict]) -> None:
         lines.append("\t".join(tsv_value(row.get(header)) for header in headers))
     path.write_text("\n".join(lines) + "\n")
 
+def write_formula_diagnostics(path: Path, rows: list[dict]) -> None:
+    headers = [
+        "stage",
+        "formula_label",
+        "quantity",
+        "lambda_spread",
+        "max_MW_norm",
+        "min_MW_norm",
+        "relative_MW_norm_spread",
+        "MW_norm_spread_ion",
+        "penalty_four_state_combination_meV",
+        "formula_constraint_pass",
+        "messages",
+    ]
+    lines = ["\t".join(headers)]
+    for row in rows:
+        lines.append("\t".join(tsv_value(row.get(header)) for header in headers))
+    path.write_text("\n".join(lines) + "\n")
+
 def main():
     root = Path.cwd()
     metadata = json.loads((root / "metadata.json").read_text())
     results = root / "results"
     results.mkdir(exist_ok=True)
+    summary_path = root / "final_summary.txt"
+    tmp_summary_path = root / "final_summary.txt.tmp"
+    summary_path.unlink(missing_ok=True)
+    tmp_summary_path.unlink(missing_ok=True)
     summary = []
+    stage_outputs = []
     all_diagnostics = []
     all_failures = []
+    all_formula_diagnostics = []
+    all_formula_failures = []
     for stage in metadata["stages"]:
-        text, diagnostics, failures = collect_stage(root, metadata, stage)
+        text, diagnostics, failures, formula_diagnostics, formula_failures = collect_stage(root, metadata, stage)
         all_diagnostics.extend(diagnostics)
         all_failures.extend(failures)
+        all_formula_diagnostics.extend(formula_diagnostics)
+        all_formula_failures.extend(formula_failures)
         out = results / f"{stage['name']}_{metadata['kind']}_energy.dat"
-        out.write_text(text)
+        stage_outputs.append((out, text))
         summary.append(f"[{stage['name']}]\n{text}")
     write_constraint_diagnostics(results / "constraint_diagnostics.tsv", all_diagnostics)
-    if STRICT_CONSTRAINTS and all_failures:
+    write_formula_diagnostics(results / "formula_diagnostics.tsv", all_formula_diagnostics)
+    strict_failed = STRICT_CONSTRAINTS and (all_failures or all_formula_failures)
+    for out, text in stage_outputs:
+        if strict_failed:
+            out.write_text(
+                "INVALID_CONSTRAINT_DIAGNOSTICS\n"
+                "# See results/constraint_diagnostics.tsv and results/formula_diagnostics.tsv before using these energies.\n"
+                + text
+            )
+        else:
+            out.write_text(text)
+    if strict_failed:
+        tmp_summary_path.unlink(missing_ok=True)
         details = ", ".join(
             f"{row['stage']}:{row['relpath']}({row['messages']})" for row in all_failures[:8]
         )
+        formula_details = ", ".join(
+            f"{row['stage']}:{row['formula_label']}({row['messages']})" for row in all_formula_failures[:8]
+        )
+        joined_details = "; ".join(part for part in [details, formula_details] if part)
         raise RuntimeError(
             "Constraint diagnostics failed; refusing final interaction output. "
-            f"See {results / 'constraint_diagnostics.tsv'}. First failures: {details}"
+            f"See {results / 'constraint_diagnostics.tsv'} and {results / 'formula_diagnostics.tsv'}. "
+            f"First failures: {joined_details}"
         )
-    (root / "final_summary.txt").write_text("\n".join(summary))
-    print(f"Wrote {root / 'final_summary.txt'}")
+    tmp_summary_path.write_text("\n".join(summary))
+    tmp_summary_path.replace(summary_path)
+    print(f"Wrote {summary_path}")
     print(f"Wrote {results / 'constraint_diagnostics.tsv'}")
+    print(f"Wrote {results / 'formula_diagnostics.tsv'}")
 
 if __name__ == "__main__":
     main()
@@ -2705,6 +2887,7 @@ def write_metadata(
         "requested_pair_image_shift": getattr(args, "pair_image_shift", None),
         "constraint_mode": int(getattr(args, "constraint_mode", 4)),
         "vasp_version": getattr(args, "vasp_version", None),
+        "isym": int(getattr(args, "isym", -1)),
         "max_kitaev_axis_consistency_deg": getattr(args, "max_kitaev_axis_consistency_deg", None),
         "background_axis_effective": effective_background_axis(kind, args),
         "pair_axis": args.pair_axis,
@@ -2722,6 +2905,7 @@ workflow = {workflow}
 moment = {args.moment}
 constraint_mode = {int(getattr(args, "constraint_mode", 4))}
 vasp_version = {getattr(args, "vasp_version", None)}
+isym = {int(getattr(args, "isym", -1))}
 background_axis = {effective_background_axis(kind, args)}
 pair_axis = {args.pair_axis}
 index_mode = {args.index_mode}
@@ -2730,7 +2914,7 @@ Files:
 - state_jobs.tsv: relative state directories and suggested Slurm job names.
 - run_state.sh: runs one state. Use: sbatch run_state.sh <relpath>
 - submit_all.sh: submits every row in state_jobs.tsv.
-- postprocess.sh/postprocess.py: collect energies and constraint diagnostics after jobs finish.
+- postprocess.sh/postprocess.py: collect energies plus state/formula constraint diagnostics after jobs finish.
 - metadata.json: machine-readable formulas and directory map.
 
 Energy formulas:
@@ -2738,6 +2922,7 @@ Energy formulas:
 - SIA diagonal differences use denominator 2; off-diagonal SIA and two-site four-state terms use denominator 4 before spin scaling.
 - Two-site calculations require a unique explicit POSCAR pair by default. If --allow-periodic-bond-sum was used, the reported value is a summed coupling over periodic translations and is not divided by multiplicity.
 - Jiso output is the selected axis component Jaa from --pair-axis, not a tensor trace average.
+- Strict failures remove stale final_summary.txt and mark *_energy.dat with INVALID_CONSTRAINT_DIAGNOSTICS. Check both results/constraint_diagnostics.tsv and results/formula_diagnostics.tsv.
 
 Indexing:
 - input pair/atom labels use the selected index_mode.
@@ -2904,7 +3089,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="VASP I_CONSTRAINED_M mode. Default 4 constrains direction and sign and requires VASP >= 6.4.0.",
     )
-    prep.add_argument("--vasp-version", help="VASP version used for these jobs, e.g. 6.4.3; stored in metadata and checked for mode 4")
+    prep.add_argument("--vasp-version", help="VASP version used for these jobs, e.g. 6.4.3; required for --constraint-mode 4")
+    prep.add_argument(
+        "--isym",
+        type=int,
+        default=-1,
+        help="ISYM value written to generated INCAR files; default -1 disables symmetry for tiny SOC energy differences",
+    )
     prep.add_argument(
         "--hamiltonian-sign",
         choices=["plus", "minus"],

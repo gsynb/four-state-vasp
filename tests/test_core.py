@@ -28,19 +28,22 @@ def write_mock_vasp_state(
     mw_rows: list[tuple[float, float, float]] | None = None,
     m_rows: list[tuple[float, float, float]] | None = None,
     lambda_mw_perp_rows: list[tuple[float, float, float]] | None = None,
+    ep_value: float = 0.0,
+    lambda_value: float = 10.0,
+    vasp_version: str = "6.4.1",
     include_ep: bool = True,
     include_lambda: bool = True,
     include_mw: bool = True,
     include_lambda_mw_perp: bool = True,
 ) -> None:
     state = root / rel
-    state.mkdir(parents=True)
-    state.joinpath("INCAR").write_text(f"LAMBDA = 10\nM_CONSTR = {m_constr}\n")
-    lines = [f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n"]
+    state.mkdir(parents=True, exist_ok=True)
+    state.joinpath("INCAR").write_text(f"LAMBDA = {lambda_value:.12g}\nM_CONSTR = {m_constr}\n")
+    lines = [f" vasp.{vasp_version} mock\n", f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n"]
     if include_ep:
-        lines.append("E_p = 0.0\n")
+        lines.append(f"E_p = {ep_value:.12g}\n")
     if include_lambda:
-        lines.append("lambda = 10\n")
+        lines.append(f"lambda = {lambda_value:.12g}\n")
     rows = mw_rows or []
     if include_mw:
         m_rows = m_rows or rows
@@ -200,6 +203,8 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
         self.assertEqual(fsv.version_tuple("vasp.6.4.1"), (6, 4, 1))
         fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=4, vasp_version="6.4.0"))
         fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=1, vasp_version="6.3.2"))
+        with self.assertRaisesRegex(ValueError, "--vasp-version"):
+            fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=4, vasp_version=None))
         with self.assertRaisesRegex(ValueError, "requires VASP >= 6.4.0"):
             fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=4, vasp_version="6.3.2"))
 
@@ -225,6 +230,7 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
             }
             (root / "metadata.json").write_text(json.dumps(metadata))
             (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
+            (root / "final_summary.txt").write_text("STALE_RESULT_SHOULD_NOT_SURVIVE\n")
             energies = [-10.0, -11.0, -12.0, -13.0]
             good_mw = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
             bad_background_mw = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
@@ -252,6 +258,9 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
             self.assertIn("angle>5", diag_text)
             self.assertIn("False", diag_text)
             self.assertFalse((root / "final_summary.txt").exists())
+            energy_dat = root / "results" / "single_jiso_energy.dat"
+            self.assertTrue(energy_dat.exists())
+            self.assertTrue(energy_dat.read_text().startswith("INVALID_CONSTRAINT_DIAGNOSTICS"))
 
             env = os.environ.copy()
             env["FOUR_STATE_STRICT_CONSTRAINTS"] = "0"
@@ -389,6 +398,107 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
             self.assertIn("E_p_missing", diag_text)
             self.assertIn("lambda_missing", diag_text)
             self.assertIn("MW_int_missing", diag_text)
+            self.assertFalse((root / "final_summary.txt").exists())
+
+    def test_postprocess_uses_one_suffixed_snapshot_for_energy_and_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata = {
+                "kind": "jiso",
+                "constraint_mode": 4,
+                "stages": [{"name": "single", "base": "", "suffix": "single"}],
+                "formulas": [
+                    {
+                        "kind": "jiso",
+                        "label": "Jxx",
+                        "quantity": "Jxx_meV",
+                        "states": ["s1", "s2", "s3", "s4"],
+                        "state_labels": ["upup", "updn", "dnup", "dndn"],
+                        "energy_denominator": 4.0,
+                        "hamiltonian_prefactor": 1.0,
+                        "target_global_indices_1based": [1],
+                    }
+                ],
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata))
+            (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
+            for idx, energy in enumerate([-1.0, -2.0, -3.0, -4.0], start=1):
+                write_mock_vasp_state(root, f"s{idx}", energy, "1 0 0", [(1.0, 0.0, 0.0)])
+            (root / "s1" / "OSZICAR").write_text(
+                " vasp.6.4.1 stale\n"
+                " 1 F= -999.00000000 E0= -999.00000000 d E =0\n"
+                "E_p = 0.0\n"
+                "lambda = 10\n"
+                "ion        MW_int                 M_int\n"
+                "  1 -1.00000000  0.00000000  0.00000000 -1.00000000  0.00000000  0.00000000\n"
+                "ion             lambda*MW_perp\n"
+                "  1  0.00000000  0.00000000  0.00000000\n"
+            )
+
+            passed = subprocess.run(
+                [sys.executable, "postprocess.py"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(passed.returncode, 0, passed.stderr)
+            summary = (root / "final_summary.txt").read_text()
+            self.assertNotIn("-999", summary)
+            diag_text = (root / "results" / "constraint_diagnostics.tsv").read_text()
+            self.assertIn("OSZICAR.single", diag_text)
+            self.assertNotIn("spin_sign_flip", diag_text)
+
+    def test_formula_diagnostics_fail_on_lambda_moment_and_penalty_spread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata = {
+                "kind": "jiso",
+                "constraint_mode": 4,
+                "stages": [{"name": "single", "base": "", "suffix": "single"}],
+                "formulas": [
+                    {
+                        "kind": "jiso",
+                        "label": "Jxx",
+                        "quantity": "Jxx_meV",
+                        "states": ["s1", "s2", "s3", "s4"],
+                        "state_labels": ["upup", "updn", "dnup", "dndn"],
+                        "energy_denominator": 4.0,
+                        "hamiltonian_prefactor": 1.0,
+                        "target_global_indices_1based": [1],
+                    }
+                ],
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata))
+            (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
+            ep_values = [8e-5, -8e-5, -8e-5, 8e-5]
+            for idx, energy in enumerate([-1.0, -2.0, -3.0, -4.0], start=1):
+                mw_norm = 1.2 if idx == 4 else 1.0
+                write_mock_vasp_state(
+                    root,
+                    f"s{idx}",
+                    energy,
+                    "1 0 0",
+                    [(mw_norm, 0.0, 0.0)],
+                    ep_value=ep_values[idx - 1],
+                    lambda_value=10.5 if idx == 3 else 10.0,
+                )
+
+            failed = subprocess.run(
+                [sys.executable, "postprocess.py"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            state_diag = (root / "results" / "constraint_diagnostics.tsv").read_text()
+            self.assertIn("True", state_diag)
+            formula_diag = (root / "results" / "formula_diagnostics.tsv").read_text()
+            self.assertIn("lambda_spread>", formula_diag)
+            self.assertIn("relative_MW_norm_spread>", formula_diag)
+            self.assertIn("penalty_four_state_combination>", formula_diag)
+            self.assertTrue((root / "results" / "single_jiso_energy.dat").read_text().startswith("INVALID_CONSTRAINT_DIAGNOSTICS"))
             self.assertFalse((root / "final_summary.txt").exists())
 
     def test_physical_kitaev_decomposition_ignores_local_gauge_rotation(self):
