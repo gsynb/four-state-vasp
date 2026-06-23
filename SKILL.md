@@ -171,7 +171,7 @@ The generator writes:
 - `submit_all.sh`: submits all states.
 - `postprocess.sh` and `postprocess.py`: collect final energies and write `final_summary.txt`.
 - `metadata.json`: directory map, formulas, stages, and POSCAR/magnetic-index metadata.
-- For `kitaev`, `kitaev_frames.tsv` records the matched `x/y/z` Kitaev axes, selected `gamma` axis, auxiliary `alpha/beta` axes, pair image shift, shared ligands, octahedral ligand references, axis overlaps, and bond-axis dot products.
+- For `kitaev`, `kitaev_frames.tsv` records the two-site matched `x/y/z` Kitaev axes, selected `gamma` axis, auxiliary `alpha/beta` axes, pair image shift, shared ligands, octahedral ligand references, axis overlaps, axis-consistency angles, and bond-axis dot products.
 
 For `--workflow pbe-hse`, each state has both `pbe/<relpath>` and `<relpath>`. `run_state.sh` runs PBE+U first, then copies `WAVECAR/CHGCAR` into the HSE no-U directory.
 
@@ -182,7 +182,13 @@ For `--workflow pbe-hse`, each state has both `pbe/<relpath>` and `<relpath>`. `
 - Jiso default: non-pair magnetic atoms along `x`, pair spins along `z`.
 - SIA uses component-specific orthogonal backgrounds following the `single_fix/4state.py` logic.
 - Kitaev axis detection defaults to nonmagnetic atoms as ligands unless `--ligand-elements` is provided; prefer explicit ligand elements for mixed-anion structures. The default metal-ligand cutoff is `4.5` A for Kitaev detection.
-- Kitaev axis detection follows the improved `generated_materials` `axis1.py` workflow: select two shared edge ligands, build a pair reference basis, use nearby octahedral ligand bonds to stabilize handedness, align the ideal `x/y/z` Kitaev basis by row/sign and Cartesian component permutations, then choose `gamma` as the matched axis most perpendicular to the metal-metal bond.
-- Use `--kitaev-no-component-permutation` when reproducing older `generated_materials` runs that matched the ideal Kitaev rows by row order and sign only.
-- Direct `prepare --kind kitaev` gives the `J_gamma_gamma` projection. For the physically useful Kitaev anisotropy, run full `jani` and then `kitaev-report` to inspect `K_gamma_minus_alpha_beta_avg_meV` and `K_gamma_minus_trace_iso_meV`.
+- Kitaev axis detection follows the improved `generated_materials` workflow but is now rotation-covariant: select two cutoff-shared edge ligands, build separate reference bases for the two magnetic sites, use nearby octahedral ligand bonds to stabilize handedness, continuously project the ideal `x/y/z` Kitaev basis into each local basis, then choose `gamma` as the site-i axis most perpendicular to the metal-metal bond.
+- If two cutoff-shared ligands are not found, stop and ask the user to check `--ligand-elements`/`--metal-ligand-cutoff`; use `--allow-kitaev-ligand-fallback` only for exploratory geometry checks.
+- Use `--kitaev-no-component-permutation` when reproducing older `generated_materials` runs that used a discrete row/sign match without Cartesian component permutation.
+- Direct `prepare --kind kitaev` gives the `J_gamma_gamma` projection using site-i and site-j local `gamma` axes. For the physically useful Kitaev anisotropy, run full `jani` and then `kitaev-report` to inspect `K_gamma_minus_alpha_beta_avg_meV`, `traceless_gamma_anisotropy_meV`, `Gamma_alpha_beta_meV`, `Gamma_prime_avg_meV`, and DMI components.
+- `prepare` validates templates before writing state trees: positive `LAMBDA`, enough positive `RWIGS`, no `ISPIN=2`; `jani`/`sia`/`kitaev` require `LSORBIT=.TRUE.`, while `biqua` rejects `LSORBIT=.TRUE.`.
+- `prepare --kind jiso` reports the selected axis component `Jaa`, not the trace-average isotropic exchange.
+- Formula denominators are stored per entry in `metadata.json`; SIA diagonal differences use base denominator 2, off-diagonal SIA and two-site four-state terms use base denominator 4, then spin convention and equivalent-bond multiplicity are applied.
+- `bootstrap` only fills POTCAR-derived `RWIGS` by default; add `--ldau` only when the built-in example U values are intentionally desired and will be reviewed.
+- `kitaev-report --jani-root` must be given `--stage` when `final_summary.txt` contains more than one stage.
 - Energy unit in postprocessing: meV.

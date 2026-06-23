@@ -28,8 +28,8 @@ SIA_COMPONENTS = ["Axy", "Axz", "Ayz", "Ayy_minus_Axx", "Azz_minus_Axx"]
 JISO_SPINS = ["upup", "updn", "dnup", "dndn"]
 STAGE_SINGLE = [{"name": "single", "base": "", "suffix": "single"}]
 STAGE_PBE_HSE = [
-    {"name": "hse_no_u", "base": "", "suffix": "hse_no_u"},
     {"name": "pbe_pre", "base": "pbe", "suffix": "pbe_pre"},
+    {"name": "hse_no_u", "base": "", "suffix": "hse_no_u"},
 ]
 REQUIRED_INPUTS = ["INCAR", "KPOINTS", "POSCAR", "POTCAR"]
 AXIS = {
@@ -87,6 +87,14 @@ class PairInfo:
 
 
 @dataclass(frozen=True)
+class PairBondContext:
+    image_shift: tuple[int, int, int]
+    distance: float
+    multiplicity: int
+    equivalent_shifts: list[tuple[int, int, int]]
+
+
+@dataclass(frozen=True)
 class NeighborContact:
     shell: int
     distance: float
@@ -113,6 +121,9 @@ class KitaevFrame:
     gamma_axis: tuple[float, float, float]
     local_x: tuple[float, float, float]
     local_y: tuple[float, float, float]
+    gamma_axis_j: tuple[float, float, float]
+    local_x_j: tuple[float, float, float]
+    local_y_j: tuple[float, float, float]
     bond_axis: tuple[float, float, float]
     pair_shift: tuple[int, int, int]
     shared_ligands: list[tuple[int, tuple[int, int, int], float, float]]
@@ -120,13 +131,20 @@ class KitaevFrame:
     alpha_label: str
     beta_label: str
     kitaev_axes: list[tuple[str, tuple[float, float, float]]]
+    kitaev_axes_j: list[tuple[str, tuple[float, float, float]]]
     reference_basis: list[tuple[float, float, float]]
+    reference_basis_j: list[tuple[float, float, float]]
     axis_overlaps: tuple[float, float, float]
+    axis_overlaps_j: tuple[float, float, float]
     axis_bond_dots: tuple[float, float, float]
+    axis_consistency_degrees: tuple[float, float, float]
     ligand_method: str
     axis_match: str
+    axis_match_j: str
     octahedral_ligands: list[tuple[int, tuple[int, int, int], float]]
+    octahedral_ligands_j: list[tuple[int, tuple[int, int, int], float]]
     octahedral_angle_error: float | None
+    octahedral_angle_error_j: float | None
 
 
 def is_int_token(token: str) -> bool:
@@ -191,6 +209,25 @@ def vec_normalize(a: Iterable[float], label: str = "vector") -> tuple[float, flo
     return tuple(float(x) / length for x in a)  # type: ignore[return-value]
 
 
+def vec_angle_degrees(a: Iterable[float], b: Iterable[float]) -> float:
+    ua = vec_normalize(a, "angle vector a")
+    ub = vec_normalize(b, "angle vector b")
+    cos_theta = max(-1.0, min(1.0, vec_dot(ua, ub)))
+    return math.degrees(math.acos(cos_theta))
+
+
+def basis_linear_combination(
+    coeffs: Iterable[float],
+    basis: list[tuple[float, float, float]],
+    label: str,
+) -> tuple[float, float, float]:
+    cx, cy, cz = coeffs
+    vec = (0.0, 0.0, 0.0)
+    for coeff, axis in zip((cx, cy, cz), basis):
+        vec = vec_add(vec, vec_scale(axis, float(coeff)))
+    return vec_normalize(vec, label)
+
+
 def det3(rows: list[tuple[float, float, float]]) -> float:
     a, b, c = rows
     return vec_dot(a, vec_cross(b, c))
@@ -230,11 +267,30 @@ def nearest_int(value: float) -> int:
 def nearest_image_delta(
     frac_i: tuple[float, float, float],
     frac_j: tuple[float, float, float],
+    lattice: list[tuple[float, float, float]],
+    search_radius: int = 2,
 ) -> tuple[tuple[float, float, float], tuple[int, int, int]]:
     raw = vec_sub(frac_j, frac_i)
-    shift = tuple(-nearest_int(x) for x in raw)  # type: ignore[assignment]
-    wrapped = (raw[0] + shift[0], raw[1] + shift[1], raw[2] + shift[2])
-    return wrapped, shift  # type: ignore[return-value]
+    center = tuple(-nearest_int(x) for x in raw)
+    best_shift: tuple[int, int, int] | None = None
+    best_frac: tuple[float, float, float] | None = None
+    best_distance = float("inf")
+    best_tie = (0, 0, 0, 0)
+    for dx in range(-search_radius, search_radius + 1):
+        for dy in range(-search_radius, search_radius + 1):
+            for dz in range(-search_radius, search_radius + 1):
+                shift = (center[0] + dx, center[1] + dy, center[2] + dz)
+                disp_frac = (raw[0] + shift[0], raw[1] + shift[1], raw[2] + shift[2])
+                distance = vec_norm(frac_to_cart(disp_frac, lattice))
+                tie = (abs(shift[0]) + abs(shift[1]) + abs(shift[2]), abs(shift[0]), abs(shift[1]), abs(shift[2]))
+                if distance < best_distance - 1e-10 or (abs(distance - best_distance) <= 1e-10 and tie < best_tie):
+                    best_shift = shift
+                    best_frac = disp_frac
+                    best_distance = distance
+                    best_tie = tie
+    if best_shift is None or best_frac is None:
+        raise ValueError("Could not determine nearest periodic image")
+    return best_frac, best_shift
 
 
 def lattice_heights(lattice: list[tuple[float, float, float]]) -> list[float]:
@@ -393,6 +449,77 @@ def translation_search_extent(info: PoscarInfo, cutoff: float) -> int:
     if scale <= 1e-12:
         raise ValueError("Cannot determine POSCAR cell size")
     return max(1, int(math.ceil(cutoff / scale)) + 1)
+
+
+def pair_distance_for_shift(info: PoscarInfo, pair: PairInfo, shift: tuple[int, int, int]) -> float:
+    disp_frac = (
+        info.frac_coords[pair.global_j][0] + shift[0] - info.frac_coords[pair.global_i][0],
+        info.frac_coords[pair.global_j][1] + shift[1] - info.frac_coords[pair.global_i][1],
+        info.frac_coords[pair.global_j][2] + shift[2] - info.frac_coords[pair.global_i][2],
+    )
+    return vec_norm(frac_to_cart(disp_frac, info.lattice))
+
+
+def pair_bond_context(info: PoscarInfo, pair: PairInfo, args: argparse.Namespace) -> PairBondContext:
+    requested_shift = tuple(getattr(args, "pair_image_shift", None) or ())
+    if requested_shift:
+        if len(requested_shift) != 3:
+            raise ValueError("--pair-image-shift requires exactly three integers")
+        image_shift = requested_shift  # type: ignore[assignment]
+        distance = pair_distance_for_shift(info, pair, image_shift)
+    else:
+        image_shift, _, _, distance = nearest_pair_image(info, pair)
+    tol = getattr(args, "bond_distance_tol", 0.02)
+    extent = translation_search_extent(info, distance + tol + 0.5)
+    equivalent_shifts: list[tuple[int, int, int]] = []
+    for tx in range(-extent, extent + 1):
+        for ty in range(-extent, extent + 1):
+            for tz in range(-extent, extent + 1):
+                shift = (tx, ty, tz)
+                cand_distance = pair_distance_for_shift(info, pair, shift)
+                if abs(cand_distance - distance) <= tol:
+                    equivalent_shifts.append(shift)
+    equivalent_shifts.sort(key=lambda item: (abs(item[0]) + abs(item[1]) + abs(item[2]), item))
+    if image_shift not in equivalent_shifts:
+        equivalent_shifts.insert(0, image_shift)
+    return PairBondContext(
+        image_shift=image_shift,
+        distance=distance,
+        multiplicity=max(1, len(equivalent_shifts)),
+        equivalent_shifts=equivalent_shifts,
+    )
+
+
+def spin_scale(args: argparse.Namespace, power: int) -> float:
+    if getattr(args, "spin_convention", "unit_vector") == "unit_vector":
+        return 1.0
+    spin_length = float(getattr(args, "spin_length_S", 1.0))
+    if spin_length <= 0:
+        raise ValueError("--spin-length-S must be positive")
+    return spin_length**power
+
+
+def hamiltonian_prefactor(args: argparse.Namespace) -> float:
+    return -1.0 if getattr(args, "hamiltonian_sign", "plus") == "minus" else 1.0
+
+
+def energy_denominator(
+    args: argparse.Namespace,
+    base_denominator: float,
+    spin_power: int,
+    bond_multiplicity: int = 1,
+) -> float:
+    if bond_multiplicity < 1:
+        raise ValueError("bond multiplicity must be >= 1")
+    return base_denominator * float(bond_multiplicity) * spin_scale(args, spin_power)
+
+
+def sia_energy_denominator(component: str) -> float:
+    return 2.0 if component in {"Ayy_minus_Axx", "Azz_minus_Axx"} else 4.0
+
+
+def format_shifts(shifts: list[tuple[int, int, int]]) -> str:
+    return ";".join(format_shift(shift) for shift in shifts)
 
 
 def cluster_contacts(contacts: list[NeighborContact], shell_tol: float) -> list[NeighborContact]:
@@ -648,7 +775,7 @@ def nearest_pair_image(
     info: PoscarInfo,
     pair: PairInfo,
 ) -> tuple[tuple[int, int, int], tuple[float, float, float], tuple[float, float, float], float]:
-    disp_frac, shift = nearest_image_delta(info.frac_coords[pair.global_i], info.frac_coords[pair.global_j])
+    disp_frac, shift = nearest_image_delta(info.frac_coords[pair.global_i], info.frac_coords[pair.global_j], info.lattice)
     disp_cart = frac_to_cart(disp_frac, info.lattice)
     return shift, disp_frac, disp_cart, vec_norm(disp_cart)
 
@@ -690,7 +817,7 @@ def nearest_ligand_images(
 ) -> list[tuple[int, tuple[int, int, int], float, tuple[float, float, float], tuple[float, float, float]]]:
     ranked: list[tuple[int, tuple[int, int, int], float, tuple[float, float, float], tuple[float, float, float]]] = []
     for lig_idx in ligand_global_indices:
-        disp_frac, shift = nearest_image_delta(center_frac, info.frac_coords[lig_idx])
+        disp_frac, shift = nearest_image_delta(center_frac, info.frac_coords[lig_idx], info.lattice)
         lig_frac = vec_add(info.frac_coords[lig_idx], shift)
         disp_cart = frac_to_cart(disp_frac, info.lattice)
         ranked.append((lig_idx, shift, vec_norm(disp_cart), lig_frac, disp_cart))
@@ -729,10 +856,18 @@ def choose_kitaev_ligands(
     cutoff: float,
     pair_shift: tuple[int, int, int],
     pair_distance: float,
+    allow_fallback: bool = False,
 ) -> tuple[list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]], str]:
     shared = find_shared_ligands(info, pair, ligand_global_indices, cutoff, pair_shift)
     if len(shared) >= 2:
         return shared[:2], "shared_within_cutoff"
+
+    if not allow_fallback:
+        raise ValueError(
+            f"{pair.label} cannot confirm two shared ligand images within {cutoff:.3f} A. "
+            "Pass --ligand-elements/--metal-ligand-cutoff explicitly, or use "
+            "--allow-kitaev-ligand-fallback only for exploratory geometry checks."
+        )
 
     i_frac = info.frac_coords[pair.global_i]
     j_frac = vec_add(info.frac_coords[pair.global_j], pair_shift)
@@ -771,8 +906,9 @@ def find_octahedral_basis(
     center_global: int,
     ligand_global_indices: list[int],
     cutoff: float,
+    center_frac_override: tuple[float, float, float] | None = None,
 ) -> tuple[list[tuple[float, float, float]], list[tuple[int, tuple[int, int, int], float]], float] | None:
-    center_frac = info.frac_coords[center_global]
+    center_frac = center_frac_override or info.frac_coords[center_global]
     shell = nearest_ligand_images(info, center_frac, ligand_global_indices, 12)
     local_shell = [item for item in shell if item[2] <= cutoff]
     if len(local_shell) < 6:
@@ -803,12 +939,11 @@ def find_octahedral_basis(
 
 def construct_shared_ligand_reference_basis(
     info: PoscarInfo,
-    pair: PairInfo,
+    center_frac: tuple[float, float, float],
     chosen_ligands: list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]],
     octahedral_basis: list[tuple[float, float, float]] | None,
 ) -> list[tuple[float, float, float]]:
-    i_frac = info.frac_coords[pair.global_i]
-    ligand_vecs = [frac_to_cart(vec_sub(item[4], i_frac), info.lattice) for item in chosen_ligands[:2]]
+    ligand_vecs = [frac_to_cart(vec_sub(item[4], center_frac), info.lattice) for item in chosen_ligands[:2]]
     x_axis = vec_normalize(ligand_vecs[0], "first shared-ligand vector")
     second_axis = vec_normalize(ligand_vecs[1], "second shared-ligand vector")
     y_axis = vec_sub(second_axis, vec_scale(x_axis, vec_dot(second_axis, x_axis)))
@@ -829,6 +964,14 @@ def align_ideal_kitaev_basis(
 ) -> tuple[list[tuple[float, float, float]], tuple[float, float, float], str]:
     reference = [vec_normalize(row, f"reference basis row {idx + 1}") for idx, row in enumerate(reference_basis)]
     ideal = [vec_normalize(row, f"ideal Kitaev basis row {idx + 1}") for idx, row in enumerate(IDEAL_KITAEV_BASIS)]
+    if allow_component_permutation:
+        basis = [
+            basis_linear_combination(row, reference, f"Kitaev {label} axis")
+            for label, row in zip(KITAEV_AXIS_LABELS, ideal)
+        ]
+        overlaps = tuple(abs(vec_dot(basis[idx], reference[idx])) for idx in range(3))
+        return basis, overlaps, "continuous_reference_projection"
+
     component_perms = list(permutations(range(3))) if allow_component_permutation else [(0, 1, 2)]
     component_sign_sets = list(product((-1.0, 1.0), repeat=3)) if allow_component_permutation else [(1.0, 1.0, 1.0)]
 
@@ -895,7 +1038,11 @@ def fallback_perpendicular_axis(axis: tuple[float, float, float]) -> tuple[float
 
 def detect_kitaev_frame(info: PoscarInfo, mag: list[int], pair: PairInfo, args: argparse.Namespace) -> KitaevFrame:
     ligands = ligand_indices(info, mag, getattr(args, "ligand_elements", None))
-    pair_shift, pair_disp_frac, pair_disp_cart, pair_distance = nearest_pair_image(info, pair)
+    bond = pair_bond_context(info, pair, args)
+    pair_shift = bond.image_shift
+    pair_disp_frac = vec_sub(vec_add(info.frac_coords[pair.global_j], pair_shift), info.frac_coords[pair.global_i])
+    pair_disp_cart = frac_to_cart(pair_disp_frac, info.lattice)
+    pair_distance = bond.distance
     if pair_distance > getattr(args, "kitaev_pair_cutoff", 10.0):
         raise ValueError(
             f"{pair.label} nearest image distance is {pair_distance:.4f} A, larger than --kitaev-pair-cutoff"
@@ -907,50 +1054,89 @@ def detect_kitaev_frame(info: PoscarInfo, mag: list[int], pair: PairInfo, args: 
         args.metal_ligand_cutoff,
         pair_shift,
         pair_distance,
+        getattr(args, "allow_kitaev_ligand_fallback", False),
     )
-    octahedral = find_octahedral_basis(info, pair.global_i, ligands, args.metal_ligand_cutoff)
-    if octahedral:
-        octahedral_basis, octahedral_ligands, octahedral_angle_error = octahedral
+    i_frac = info.frac_coords[pair.global_i]
+    j_frac = vec_add(info.frac_coords[pair.global_j], pair_shift)
+    octahedral_i = find_octahedral_basis(info, pair.global_i, ligands, args.metal_ligand_cutoff, i_frac)
+    octahedral_j = find_octahedral_basis(info, pair.global_j, ligands, args.metal_ligand_cutoff, j_frac)
+    if octahedral_i:
+        octahedral_basis, octahedral_ligands, octahedral_angle_error = octahedral_i
     else:
         octahedral_basis = []
         octahedral_ligands = []
         octahedral_angle_error = None
-    reference_basis = construct_shared_ligand_reference_basis(
+    if octahedral_j:
+        octahedral_basis_j, octahedral_ligands_j, octahedral_angle_error_j = octahedral_j
+    else:
+        octahedral_basis_j = []
+        octahedral_ligands_j = []
+        octahedral_angle_error_j = None
+    reference_basis_i = construct_shared_ligand_reference_basis(
         info,
-        pair,
+        i_frac,
         chosen,
         octahedral_basis if octahedral_basis else None,
     )
-    kitaev_basis, axis_overlaps, axis_match = align_ideal_kitaev_basis(
-        reference_basis,
+    reference_basis_j = construct_shared_ligand_reference_basis(
+        info,
+        j_frac,
+        chosen,
+        octahedral_basis_j if octahedral_basis_j else None,
+    )
+    kitaev_basis_i, axis_overlaps_i, axis_match_i = align_ideal_kitaev_basis(
+        reference_basis_i,
         allow_component_permutation=not getattr(args, "kitaev_no_component_permutation", False),
     )
-    kitaev_axes = list(zip(KITAEV_AXIS_LABELS, kitaev_basis))
+    kitaev_basis_j, axis_overlaps_j, axis_match_j = align_ideal_kitaev_basis(
+        reference_basis_j,
+        allow_component_permutation=not getattr(args, "kitaev_no_component_permutation", False),
+    )
+    kitaev_axes_i = list(zip(KITAEV_AXIS_LABELS, kitaev_basis_i))
+    kitaev_axes_j = list(zip(KITAEV_AXIS_LABELS, kitaev_basis_j))
     bond_axis = vec_normalize(pair_disp_cart, "metal-metal bond")
-    alpha_idx, beta_idx, gamma_idx, axis_bond_dots = choose_gamma_from_bond(kitaev_axes, bond_axis)
-    alpha_label, local_x = kitaev_axes[alpha_idx]
-    beta_label, local_y = kitaev_axes[beta_idx]
-    gamma_label, gamma = kitaev_axes[gamma_idx]
+    alpha_idx, beta_idx, gamma_idx, axis_bond_dots = choose_gamma_from_bond(kitaev_axes_i, bond_axis)
+    alpha_label, local_x = kitaev_axes_i[alpha_idx]
+    beta_label, local_y = kitaev_axes_i[beta_idx]
+    gamma_label, gamma = kitaev_axes_i[gamma_idx]
+    axis_map_j = {label: axis for label, axis in kitaev_axes_j}
+    local_x_j = axis_map_j[alpha_label]
+    local_y_j = axis_map_j[beta_label]
+    gamma_j = axis_map_j[gamma_label]
+    axis_consistency = []
+    for label, axis_i in kitaev_axes_i:
+        angle = vec_angle_degrees(axis_i, axis_map_j[label])
+        axis_consistency.append(min(angle, 180.0 - angle))
     shared_summary = [(idx, shift, di, dj) for idx, shift, di, dj, _ in chosen]
     return KitaevFrame(
         pair=pair,
         gamma_axis=gamma,
         local_x=local_x,
         local_y=local_y,
+        gamma_axis_j=gamma_j,
+        local_x_j=local_x_j,
+        local_y_j=local_y_j,
         bond_axis=bond_axis,
         pair_shift=pair_shift,
         shared_ligands=shared_summary,
         gamma_label=gamma_label,
         alpha_label=alpha_label,
         beta_label=beta_label,
-        kitaev_axes=kitaev_axes,
-        reference_basis=reference_basis,
-        axis_overlaps=axis_overlaps,
+        kitaev_axes=kitaev_axes_i,
+        kitaev_axes_j=kitaev_axes_j,
+        reference_basis=reference_basis_i,
+        reference_basis_j=reference_basis_j,
+        axis_overlaps=axis_overlaps_i,
+        axis_overlaps_j=axis_overlaps_j,
         axis_bond_dots=axis_bond_dots,
+        axis_consistency_degrees=tuple(axis_consistency),  # type: ignore[arg-type]
         ligand_method=ligand_method,
-        axis_match=axis_match,
+        axis_match=axis_match_i,
+        axis_match_j=axis_match_j,
         octahedral_ligands=octahedral_ligands,
+        octahedral_ligands_j=octahedral_ligands_j,
         octahedral_angle_error=octahedral_angle_error,
+        octahedral_angle_error_j=octahedral_angle_error_j,
     )
 
 
@@ -963,13 +1149,25 @@ def frame_rows(frame: KitaevFrame, info: PoscarInfo) -> list[str]:
         f"{atom_label(info, idx)}@{format_shift(shift)}(d={dist:.4f})"
         for idx, shift, dist in frame.octahedral_ligands
     )
+    octahedral_ligands_j = ";".join(
+        f"{atom_label(info, idx)}@{format_shift(shift)}(d={dist:.4f})"
+        for idx, shift, dist in frame.octahedral_ligands_j
+    )
     axis_rows = [
-        f"kitaev_{label}_axis_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
+        f"kitaev_i_{label}_axis_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
         for label, axis in frame.kitaev_axes
     ]
+    axis_rows_j = [
+        f"kitaev_j_{label}_axis_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
+        for label, axis in frame.kitaev_axes_j
+    ]
     reference_rows = [
-        f"reference_basis_{idx}_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
+        f"reference_i_basis_{idx}_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
         for idx, axis in enumerate(frame.reference_basis, start=1)
+    ]
+    reference_rows_j = [
+        f"reference_j_basis_{idx}_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
+        for idx, axis in enumerate(frame.reference_basis_j, start=1)
     ]
     return [
         f"pair\t{frame.pair.label}",
@@ -977,48 +1175,77 @@ def frame_rows(frame: KitaevFrame, info: PoscarInfo) -> list[str]:
         f"gamma_label\t{frame.gamma_label}",
         f"alpha_label\t{frame.alpha_label}",
         f"beta_label\t{frame.beta_label}",
-        f"gamma_axis_cart\t{frame.gamma_axis[0]:.10f}\t{frame.gamma_axis[1]:.10f}\t{frame.gamma_axis[2]:.10f}",
-        f"local_x_cart\t{frame.local_x[0]:.10f}\t{frame.local_x[1]:.10f}\t{frame.local_x[2]:.10f}",
-        f"local_y_cart\t{frame.local_y[0]:.10f}\t{frame.local_y[1]:.10f}\t{frame.local_y[2]:.10f}",
+        f"gamma_axis_cart_i\t{frame.gamma_axis[0]:.10f}\t{frame.gamma_axis[1]:.10f}\t{frame.gamma_axis[2]:.10f}",
+        f"gamma_axis_cart_j\t{frame.gamma_axis_j[0]:.10f}\t{frame.gamma_axis_j[1]:.10f}\t{frame.gamma_axis_j[2]:.10f}",
+        f"local_x_cart_i\t{frame.local_x[0]:.10f}\t{frame.local_x[1]:.10f}\t{frame.local_x[2]:.10f}",
+        f"local_x_cart_j\t{frame.local_x_j[0]:.10f}\t{frame.local_x_j[1]:.10f}\t{frame.local_x_j[2]:.10f}",
+        f"local_y_cart_i\t{frame.local_y[0]:.10f}\t{frame.local_y[1]:.10f}\t{frame.local_y[2]:.10f}",
+        f"local_y_cart_j\t{frame.local_y_j[0]:.10f}\t{frame.local_y_j[1]:.10f}\t{frame.local_y_j[2]:.10f}",
         f"bond_axis_cart\t{frame.bond_axis[0]:.10f}\t{frame.bond_axis[1]:.10f}\t{frame.bond_axis[2]:.10f}",
-        f"axis_overlaps\t{frame.axis_overlaps[0]:.8f}\t{frame.axis_overlaps[1]:.8f}\t{frame.axis_overlaps[2]:.8f}",
+        f"axis_overlaps_i\t{frame.axis_overlaps[0]:.8f}\t{frame.axis_overlaps[1]:.8f}\t{frame.axis_overlaps[2]:.8f}",
+        f"axis_overlaps_j\t{frame.axis_overlaps_j[0]:.8f}\t{frame.axis_overlaps_j[1]:.8f}\t{frame.axis_overlaps_j[2]:.8f}",
+        f"axis_consistency_deg_xyz\t{frame.axis_consistency_degrees[0]:.6f}\t{frame.axis_consistency_degrees[1]:.6f}\t{frame.axis_consistency_degrees[2]:.6f}",
         f"axis_bond_abs_dots_xyz\t{frame.axis_bond_dots[0]:.8f}\t{frame.axis_bond_dots[1]:.8f}\t{frame.axis_bond_dots[2]:.8f}",
         f"ligand_selection_method\t{frame.ligand_method}",
-        f"axis_match\t{frame.axis_match}",
-        f"octahedral_max_orthogonality_error_deg\t{frame.octahedral_angle_error:.6f}" if frame.octahedral_angle_error is not None else "octahedral_max_orthogonality_error_deg\tNA",
-        f"octahedral_ligands\t{octahedral_ligands}",
+        f"axis_match_i\t{frame.axis_match}",
+        f"axis_match_j\t{frame.axis_match_j}",
+        f"octahedral_i_max_orthogonality_error_deg\t{frame.octahedral_angle_error:.6f}" if frame.octahedral_angle_error is not None else "octahedral_i_max_orthogonality_error_deg\tNA",
+        f"octahedral_j_max_orthogonality_error_deg\t{frame.octahedral_angle_error_j:.6f}" if frame.octahedral_angle_error_j is not None else "octahedral_j_max_orthogonality_error_deg\tNA",
+        f"octahedral_ligands_i\t{octahedral_ligands}",
+        f"octahedral_ligands_j\t{octahedral_ligands_j}",
         f"shared_ligands\t{ligands}",
         *axis_rows,
+        *axis_rows_j,
         *reference_rows,
+        *reference_rows_j,
     ]
 
 
 def write_kitaev_frames(out_root: Path, frames: list[KitaevFrame], info: PoscarInfo) -> None:
     lines = [
         "pair\tgamma_label\talpha_label\tbeta_label\tpair_shift_j\t"
-        "gamma_x\tgamma_y\tgamma_z\talpha_x\talpha_y\talpha_z\tbeta_x\tbeta_y\tbeta_z\t"
-        "kitaev_x_x\tkitaev_x_y\tkitaev_x_z\tkitaev_y_x\tkitaev_y_y\tkitaev_y_z\tkitaev_z_x\tkitaev_z_y\tkitaev_z_z\t"
-        "overlap_x\toverlap_y\toverlap_z\tbond_dot_x\tbond_dot_y\tbond_dot_z\t"
-        "ligand_method\toctahedral_max_orthogonality_error_deg\tshared_ligands\toctahedral_ligands\taxis_match\n"
+        "gamma_i_x\tgamma_i_y\tgamma_i_z\tgamma_j_x\tgamma_j_y\tgamma_j_z\t"
+        "alpha_i_x\talpha_i_y\talpha_i_z\talpha_j_x\talpha_j_y\talpha_j_z\t"
+        "beta_i_x\tbeta_i_y\tbeta_i_z\tbeta_j_x\tbeta_j_y\tbeta_j_z\t"
+        "kitaev_i_x_x\tkitaev_i_x_y\tkitaev_i_x_z\tkitaev_i_y_x\tkitaev_i_y_y\tkitaev_i_y_z\tkitaev_i_z_x\tkitaev_i_z_y\tkitaev_i_z_z\t"
+        "kitaev_j_x_x\tkitaev_j_x_y\tkitaev_j_x_z\tkitaev_j_y_x\tkitaev_j_y_y\tkitaev_j_y_z\tkitaev_j_z_x\tkitaev_j_z_y\tkitaev_j_z_z\t"
+        "overlap_i_x\toverlap_i_y\toverlap_i_z\toverlap_j_x\toverlap_j_y\toverlap_j_z\t"
+        "axis_consistency_deg_x\taxis_consistency_deg_y\taxis_consistency_deg_z\tbond_dot_x\tbond_dot_y\tbond_dot_z\t"
+        "ligand_method\toctahedral_i_max_orthogonality_error_deg\toctahedral_j_max_orthogonality_error_deg\t"
+        "shared_ligands\toctahedral_ligands_i\toctahedral_ligands_j\taxis_match_i\taxis_match_j\n"
     ]
     for frame in frames:
         ligands = ";".join(f"{atom_label(info, idx)}@{format_shift(shift)}" for idx, shift, _, _ in frame.shared_ligands)
         octahedral_ligands = ";".join(
             f"{atom_label(info, idx)}@{format_shift(shift)}" for idx, shift, _ in frame.octahedral_ligands
         )
+        octahedral_ligands_j = ";".join(
+            f"{atom_label(info, idx)}@{format_shift(shift)}" for idx, shift, _ in frame.octahedral_ligands_j
+        )
         axis_map = {label: axis for label, axis in frame.kitaev_axes}
-        oct_err = f"{frame.octahedral_angle_error:.6f}" if frame.octahedral_angle_error is not None else "NA"
+        axis_map_j = {label: axis for label, axis in frame.kitaev_axes_j}
+        oct_err_i = f"{frame.octahedral_angle_error:.6f}" if frame.octahedral_angle_error is not None else "NA"
+        oct_err_j = f"{frame.octahedral_angle_error_j:.6f}" if frame.octahedral_angle_error_j is not None else "NA"
         lines.append(
             f"{frame.pair.label}\t{frame.gamma_label}\t{frame.alpha_label}\t{frame.beta_label}\t{format_shift(frame.pair_shift)}\t"
             f"{frame.gamma_axis[0]:.10f}\t{frame.gamma_axis[1]:.10f}\t{frame.gamma_axis[2]:.10f}\t"
+            f"{frame.gamma_axis_j[0]:.10f}\t{frame.gamma_axis_j[1]:.10f}\t{frame.gamma_axis_j[2]:.10f}\t"
             f"{frame.local_x[0]:.10f}\t{frame.local_x[1]:.10f}\t{frame.local_x[2]:.10f}\t"
+            f"{frame.local_x_j[0]:.10f}\t{frame.local_x_j[1]:.10f}\t{frame.local_x_j[2]:.10f}\t"
             f"{frame.local_y[0]:.10f}\t{frame.local_y[1]:.10f}\t{frame.local_y[2]:.10f}\t"
+            f"{frame.local_y_j[0]:.10f}\t{frame.local_y_j[1]:.10f}\t{frame.local_y_j[2]:.10f}\t"
             f"{axis_map['x'][0]:.10f}\t{axis_map['x'][1]:.10f}\t{axis_map['x'][2]:.10f}\t"
             f"{axis_map['y'][0]:.10f}\t{axis_map['y'][1]:.10f}\t{axis_map['y'][2]:.10f}\t"
             f"{axis_map['z'][0]:.10f}\t{axis_map['z'][1]:.10f}\t{axis_map['z'][2]:.10f}\t"
+            f"{axis_map_j['x'][0]:.10f}\t{axis_map_j['x'][1]:.10f}\t{axis_map_j['x'][2]:.10f}\t"
+            f"{axis_map_j['y'][0]:.10f}\t{axis_map_j['y'][1]:.10f}\t{axis_map_j['y'][2]:.10f}\t"
+            f"{axis_map_j['z'][0]:.10f}\t{axis_map_j['z'][1]:.10f}\t{axis_map_j['z'][2]:.10f}\t"
             f"{frame.axis_overlaps[0]:.8f}\t{frame.axis_overlaps[1]:.8f}\t{frame.axis_overlaps[2]:.8f}\t"
+            f"{frame.axis_overlaps_j[0]:.8f}\t{frame.axis_overlaps_j[1]:.8f}\t{frame.axis_overlaps_j[2]:.8f}\t"
+            f"{frame.axis_consistency_degrees[0]:.6f}\t{frame.axis_consistency_degrees[1]:.6f}\t{frame.axis_consistency_degrees[2]:.6f}\t"
             f"{frame.axis_bond_dots[0]:.8f}\t{frame.axis_bond_dots[1]:.8f}\t{frame.axis_bond_dots[2]:.8f}\t"
-            f"{frame.ligand_method}\t{oct_err}\t{ligands}\t{octahedral_ligands}\t{frame.axis_match}\n"
+            f"{frame.ligand_method}\t{oct_err_i}\t{oct_err_j}\t{ligands}\t{octahedral_ligands}\t{octahedral_ligands_j}\t"
+            f"{frame.axis_match}\t{frame.axis_match_j}\n"
         )
     (out_root / "kitaev_frames.tsv").write_text("".join(lines))
 
@@ -1034,17 +1261,65 @@ def rotate_tensor_to_basis(
     return [[vec_dot(basis[row], mat_vec(matrix, basis[col])) for col in range(3)] for row in range(3)]
 
 
+def rotate_tensor_between_bases(
+    matrix: list[list[float]],
+    left_basis: list[tuple[float, float, float]],
+    right_basis: list[tuple[float, float, float]],
+) -> list[list[float]]:
+    return [[vec_dot(left_basis[row], mat_vec(matrix, right_basis[col])) for col in range(3)] for row in range(3)]
+
+
 def rotate_tensor_to_frame(
     matrix: list[list[float]],
     frame: KitaevFrame,
 ) -> list[list[float]]:
-    return rotate_tensor_to_basis(matrix, [frame.local_x, frame.local_y, frame.gamma_axis])
+    return rotate_tensor_between_bases(
+        matrix,
+        [frame.local_x, frame.local_y, frame.gamma_axis],
+        [frame.local_x_j, frame.local_y_j, frame.gamma_axis_j],
+    )
 
 
-def parse_jani_summary(root: Path, pair_label: str, stage_name: str | None) -> list[list[float]]:
+def symmetric_matrix(matrix: list[list[float]]) -> list[list[float]]:
+    return [[0.5 * (matrix[i][j] + matrix[j][i]) for j in range(3)] for i in range(3)]
+
+
+def antisymmetric_dmi(matrix: list[list[float]]) -> tuple[float, float, float]:
+    return (
+        0.5 * (matrix[1][2] - matrix[2][1]),
+        0.5 * (matrix[2][0] - matrix[0][2]),
+        0.5 * (matrix[0][1] - matrix[1][0]),
+    )
+
+
+def unique_summary_stages(summary: Path) -> list[str]:
+    stages: list[str] = []
+    seen: set[str] = set()
+    for raw in summary.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            stage = line.strip("[]")
+            if stage not in seen:
+                stages.append(stage)
+                seen.add(stage)
+    return stages
+
+
+def parse_jani_summary(root: Path, pair_label: str, stage_name: str | None) -> tuple[list[list[float]], str | None]:
     summary = root / "final_summary.txt"
     if not summary.exists():
         raise FileNotFoundError(f"Jani final_summary.txt not found: {summary}")
+    stages = unique_summary_stages(summary)
+    selected_stage = stage_name
+    if selected_stage is None and len(stages) > 1:
+        raise ValueError(
+            f"{summary} contains multiple stages ({', '.join(stages)}); pass --stage explicitly, "
+            "for example --stage hse_no_u"
+        )
+    if selected_stage is None and len(stages) == 1:
+        selected_stage = stages[0]
+    if selected_stage and stages and selected_stage not in stages:
+        raise ValueError(f"Stage {selected_stage!r} not found in {summary}; available stages: {', '.join(stages)}")
     current_stage: str | None = None
     values: dict[str, float] = {}
     for raw in summary.read_text().splitlines():
@@ -1056,7 +1331,7 @@ def parse_jani_summary(root: Path, pair_label: str, stage_name: str | None) -> l
             continue
         if line.startswith("#"):
             continue
-        if stage_name and current_stage != stage_name:
+        if selected_stage and current_stage != selected_stage:
             continue
         parts = line.split()
         if len(parts) < 7:
@@ -1072,7 +1347,7 @@ def parse_jani_summary(root: Path, pair_label: str, stage_name: str | None) -> l
         [values["Jxx"], values["Jxy"], values["Jxz"]],
         [values["Jyx"], values["Jyy"], values["Jyz"]],
         [values["Jzx"], values["Jzy"], values["Jzz"]],
-    ]
+    ], selected_stage
 
 
 def matrix_lines(title: str, matrix: list[list[float]]) -> list[str]:
@@ -1093,19 +1368,42 @@ def kitaev_report(args: argparse.Namespace) -> None:
     frame = detect_kitaev_frame(info, mag, pairs[0], args)
     lines = ["Kitaev local-frame report", *frame_rows(frame, info)]
     if args.jani_root:
-        global_matrix = parse_jani_summary(Path(args.jani_root), frame.pair.label, args.stage)
-        kitaev_matrix = rotate_tensor_to_basis(global_matrix, [axis for _, axis in frame.kitaev_axes])
+        global_matrix, selected_stage = parse_jani_summary(Path(args.jani_root), frame.pair.label, args.stage)
+        axis_map_j = {label: axis for label, axis in frame.kitaev_axes_j}
+        kitaev_matrix = rotate_tensor_between_bases(
+            global_matrix,
+            [axis for _, axis in frame.kitaev_axes],
+            [axis_map_j[label] for label in KITAEV_AXIS_LABELS],
+        )
         local_matrix = rotate_tensor_to_frame(global_matrix, frame)
-        jiso_trace = sum(local_matrix[i][i] for i in range(3)) / 3.0
-        k_minus_trace = local_matrix[2][2] - jiso_trace
-        k_minus_ab = local_matrix[2][2] - 0.5 * (local_matrix[0][0] + local_matrix[1][1])
+        symmetric_local = symmetric_matrix(local_matrix)
+        dmi = antisymmetric_dmi(local_matrix)
+        trace_iso = sum(symmetric_local[i][i] for i in range(3)) / 3.0
+        j_ab_avg = 0.5 * (symmetric_local[0][0] + symmetric_local[1][1])
+        k_minus_trace = symmetric_local[2][2] - trace_iso
+        k_minus_ab = symmetric_local[2][2] - j_ab_avg
+        gamma = symmetric_local[0][1]
+        gamma_prime_avg = 0.5 * (symmetric_local[0][2] + symmetric_local[1][2])
+        gamma_prime_split = 0.5 * (symmetric_local[0][2] - symmetric_local[1][2])
+        alpha_beta_diag_split = 0.5 * (symmetric_local[0][0] - symmetric_local[1][1])
         lines.extend(matrix_lines("global_J_meV", global_matrix))
-        lines.extend(matrix_lines("kitaev_J_meV rows=(x,y,z)", kitaev_matrix))
-        lines.extend(matrix_lines("local_J_meV rows=(alpha,beta,gamma)", local_matrix))
-        lines.append(f"Jiso_trace_meV\t{jiso_trace:.8f}")
-        lines.append(f"J_gamma_gamma_meV\t{local_matrix[2][2]:.8f}")
-        lines.append(f"K_gamma_minus_trace_iso_meV\t{k_minus_trace:.8f}")
+        lines.extend(matrix_lines("kitaev_J_meV rows_i=(x,y,z) cols_j=(x,y,z)", kitaev_matrix))
+        lines.extend(matrix_lines("local_J_meV rows_i=(alpha,beta,gamma) cols_j=(alpha,beta,gamma)", local_matrix))
+        lines.extend(matrix_lines("local_symmetric_J_meV", symmetric_local))
+        if selected_stage:
+            lines.append(f"jani_stage\t{selected_stage}")
+        lines.append(f"J_trace_iso_meV\t{trace_iso:.8f}")
+        lines.append(f"J_alpha_beta_avg_meV\t{j_ab_avg:.8f}")
+        lines.append(f"J_gamma_gamma_meV\t{symmetric_local[2][2]:.8f}")
+        lines.append(f"traceless_gamma_anisotropy_meV\t{k_minus_trace:.8f}")
         lines.append(f"K_gamma_minus_alpha_beta_avg_meV\t{k_minus_ab:.8f}")
+        lines.append(f"Gamma_alpha_beta_meV\t{gamma:.8f}")
+        lines.append(f"Gamma_prime_avg_meV\t{gamma_prime_avg:.8f}")
+        lines.append(f"Gamma_prime_split_meV\t{gamma_prime_split:.8f}")
+        lines.append(f"alpha_beta_diag_split_meV\t{alpha_beta_diag_split:.8f}")
+        lines.append(f"DMI_alpha_meV\t{dmi[0]:.8f}")
+        lines.append(f"DMI_beta_meV\t{dmi[1]:.8f}")
+        lines.append(f"DMI_gamma_meV\t{dmi[2]:.8f}")
     text = "\n".join(lines) + "\n"
     print(text, end="")
     if args.out:
@@ -1179,7 +1477,76 @@ def read_incar(path: Path) -> list[str]:
     return []
 
 
-def set_incar_tags(path: Path, tags: dict[str, str]) -> None:
+def strip_incar_comment(line: str) -> str:
+    return re.split(r"[#!]", line, maxsplit=1)[0].strip()
+
+
+def read_incar_tags(path: Path) -> dict[str, str]:
+    tags: dict[str, str] = {}
+    if not path.exists():
+        return tags
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = strip_incar_comment(raw)
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        tags[key.strip().upper()] = value.strip()
+    return tags
+
+
+def parse_numeric_values(raw: str) -> list[float]:
+    values: list[float] = []
+    for token in re.split(r"[\s,;]+", raw.strip()):
+        if not token:
+            continue
+        try:
+            values.append(float(token.replace("D", "E").replace("d", "e")))
+        except ValueError:
+            continue
+    return values
+
+
+def incar_bool(raw: str) -> bool | None:
+    token = raw.strip().split()[0].strip(".").upper() if raw.strip() else ""
+    if token in {"TRUE", "T", "1", "YES"}:
+        return True
+    if token in {"FALSE", "F", "0", "NO"}:
+        return False
+    return None
+
+
+def validate_template_incar(incar: Path, info: PoscarInfo, kind: str, label: str) -> None:
+    tags = read_incar_tags(incar)
+    errors: list[str] = []
+    lambda_values = parse_numeric_values(tags.get("LAMBDA", ""))
+    if not lambda_values or max(lambda_values) <= 0:
+        errors.append("missing positive LAMBDA; VASP defaults LAMBDA to 0, so constrained moments would not be penalized")
+    rwigs_values = parse_numeric_values(tags.get("RWIGS", ""))
+    if len(rwigs_values) < len(info.elements) or any(value <= 0 for value in rwigs_values[: len(info.elements)]):
+        errors.append(f"missing positive RWIGS values for all {len(info.elements)} POSCAR element(s)")
+    if tags.get("ISPIN", "").strip().split()[:1] == ["2"]:
+        errors.append("ISPIN=2 is incompatible with the generated noncollinear setup; remove ISPIN from the template")
+    if kind in {"jani", "sia", "kitaev"} and incar_bool(tags.get("LSORBIT", "")) is not True:
+        errors.append(f"{kind} requires LSORBIT=.TRUE. for SOC-driven anisotropic terms")
+    if kind == "biqua" and incar_bool(tags.get("LSORBIT", "")) is True:
+        errors.append("biquadratic extraction should be run without LSORBIT to avoid SOC anisotropy contamination")
+    if errors:
+        formatted = "\n  - ".join(errors)
+        raise ValueError(f"Unsafe INCAR template for {label}: {incar}\n  - {formatted}")
+
+
+def validate_input_templates(info: PoscarInfo, args: argparse.Namespace) -> None:
+    templates: list[tuple[str, Path]] = []
+    if args.workflow == "pbe-hse":
+        templates.append(("pbe_pre", Path(args.pbe_input_dir or args.input_dir).resolve() / "INCAR"))
+        templates.append(("hse_no_u", Path(args.hse_input_dir or args.input_dir).resolve() / "INCAR"))
+    else:
+        templates.append(("single", Path(args.input_dir).resolve() / "INCAR"))
+    for label, incar in templates:
+        validate_template_incar(incar, info, args.kind, label)
+
+
+def set_incar_tags(path: Path, tags: dict[str, str | None]) -> None:
     lines = read_incar(path)
     seen: set[str] = set()
     out: list[str] = []
@@ -1195,11 +1562,12 @@ def set_incar_tags(path: Path, tags: dict[str, str]) -> None:
             continue
         if matched in seen:
             continue
-        out.append(f"{matched} = {tags[matched]}\n")
+        if tags[matched] is not None:
+            out.append(f"{matched} = {tags[matched]}\n")
         seen.add(matched)
     for tag, value in tags.items():
         tag = tag.upper()
-        if tag not in seen:
+        if tag not in seen and value is not None:
             out.append(f"{tag} = {value}\n")
     path.write_text("".join(out))
 
@@ -1213,19 +1581,24 @@ def copy_required_inputs(src: Path, dst: Path, poscar: Path | None = None) -> No
         shutil.copy2(source, dst / name)
 
 
-def common_incar_tags(magmom: str, args: argparse.Namespace) -> dict[str, str]:
-    tags = {
+def common_incar_tags(magmom: str, args: argparse.Namespace) -> dict[str, str | None]:
+    tags: dict[str, str | None] = {
         "MAGMOM": magmom,
         "M_CONSTR": magmom,
         "LNONCOLLINEAR": ".TRUE.",
         "I_CONSTRAINED_M": "1",
+        "ISPIN": None,
+        "NSW": "0",
+        "IBRION": "-1",
+        "LASPH": ".TRUE.",
+        "GGA_COMPAT": ".FALSE.",
     }
     if args.saxis:
         tags["SAXIS"] = " ".join(args.saxis)
     return tags
 
 
-def stage_tags(stage: str, args: argparse.Namespace) -> dict[str, str]:
+def stage_tags(stage: str, args: argparse.Namespace) -> dict[str, str | None]:
     if args.no_stage_tag_edits:
         return {}
     if stage == "pbe":
@@ -1297,6 +1670,8 @@ def generate_jani(
     nest_pairs = len(pairs) > 1
     background_axis = args.background_axis or "z"
     for pair in pairs:
+        bond = pair_bond_context(info, pair, args)
+        denominator = energy_denominator(args, 4.0, 2, bond.multiplicity)
         prefix = f"{pair.label}/" if nest_pairs else ""
         for comp in JANI_COMPONENTS:
             states = []
@@ -1315,7 +1690,13 @@ def generate_jani(
                     "quantity": f"{comp}_meV",
                     "states": states,
                     "state_labels": ["E1", "E2", "E3", "E4"],
-                    "formula": "(E1 - E2 - E3 + E4) * 1000 / 4",
+                    "formula": f"prefactor * (E1 - E2 - E3 + E4) * 1000 / {denominator:g}",
+                    "energy_denominator": denominator,
+                    "hamiltonian_prefactor": hamiltonian_prefactor(args),
+                    "bond_multiplicity": bond.multiplicity,
+                    "pair_image_shift": bond.image_shift,
+                    "equivalent_pair_shifts": bond.equivalent_shifts,
+                    "pair_distance_A": bond.distance,
                 }
             )
     return jobs, formulas
@@ -1338,6 +1719,8 @@ def generate_jiso(
         "dndn": (neg_vec(AXIS[args.pair_axis]), neg_vec(AXIS[args.pair_axis])),
     }
     for pair in pairs:
+        bond = pair_bond_context(info, pair, args)
+        denominator = energy_denominator(args, 4.0, 2, bond.multiplicity)
         states = []
         for spin in JISO_SPINS:
             ui, uj = spin_units[spin]
@@ -1352,10 +1735,17 @@ def generate_jiso(
             {
                 "label": pair.label,
                 "kind": "four_state",
-                "quantity": "Jiso_meV",
+                "quantity": f"J{args.pair_axis}{args.pair_axis}_meV",
                 "states": states,
                 "state_labels": JISO_SPINS,
-                "formula": "(E_upup - E_updn - E_dnup + E_dndn) * 1000 / 4",
+                "formula": f"prefactor * (E_upup - E_updn - E_dnup + E_dndn) * 1000 / {denominator:g}",
+                "energy_denominator": denominator,
+                "hamiltonian_prefactor": hamiltonian_prefactor(args),
+                "bond_multiplicity": bond.multiplicity,
+                "pair_image_shift": bond.image_shift,
+                "equivalent_pair_shifts": bond.equivalent_shifts,
+                "pair_distance_A": bond.distance,
+                "note": "Axis-resolved four-state exchange along --pair-axis; use Jani trace for a rotational isotropic average.",
             }
         )
     return jobs, formulas
@@ -1375,14 +1765,15 @@ def generate_kitaev(
     spin_names = ["pp", "pm", "mp", "mm"]
     nest_pairs = len(pairs) > 1
     for pair in pairs:
+        bond = pair_bond_context(info, pair, args)
+        denominator = energy_denominator(args, 4.0, 2, bond.multiplicity)
         frame = detect_kitaev_frame(info, mag, pair, args)
         frames.append(frame)
-        gamma = frame.gamma_axis
         spin_units = {
-            "pp": (gamma, gamma),
-            "pm": (gamma, neg_vec(gamma)),
-            "mp": (neg_vec(gamma), gamma),
-            "mm": (neg_vec(gamma), neg_vec(gamma)),
+            "pp": (frame.gamma_axis, frame.gamma_axis_j),
+            "pm": (frame.gamma_axis, neg_vec(frame.gamma_axis_j)),
+            "mp": (neg_vec(frame.gamma_axis), frame.gamma_axis_j),
+            "mm": (neg_vec(frame.gamma_axis), neg_vec(frame.gamma_axis_j)),
         }
         prefix = f"{pair.label}/" if nest_pairs else ""
         states: list[str] = []
@@ -1402,7 +1793,13 @@ def generate_kitaev(
                 "quantity": "J_gamma_gamma_meV",
                 "states": states,
                 "state_labels": spin_names,
-                "formula": "(E_pp - E_pm - E_mp + E_mm) * 1000 / 4",
+                "formula": f"prefactor * (E_pp - E_pm - E_mp + E_mm) * 1000 / {denominator:g}",
+                "energy_denominator": denominator,
+                "hamiltonian_prefactor": hamiltonian_prefactor(args),
+                "bond_multiplicity": bond.multiplicity,
+                "pair_image_shift": bond.image_shift,
+                "equivalent_pair_shifts": bond.equivalent_shifts,
+                "pair_distance_A": bond.distance,
                 "note": "Projection along the octahedral gamma axis. Rotate full Jani with kitaev-report for K minus isotropic part.",
             }
         )
@@ -1440,7 +1837,12 @@ def generate_sia(
                 "quantity": f"{comp}_meV",
                 "states": states,
                 "state_labels": ["E1", "E2", "E3", "E4"],
-                "formula": "(E1 - E2 - E3 + E4) * 1000 / 4",
+                "formula": (
+                    f"prefactor * (E1 - E2 - E3 + E4) * 1000 / "
+                    f"{energy_denominator(args, sia_energy_denominator(comp), 2):g}"
+                ),
+                "energy_denominator": energy_denominator(args, sia_energy_denominator(comp), 2),
+                "hamiltonian_prefactor": hamiltonian_prefactor(args),
             }
         )
     (out_root / "sia_target.tsv").write_text(
@@ -1460,6 +1862,9 @@ def generate_biqua(
     if len(pairs) != 1:
         raise ValueError("biquadratic generation expects exactly one pair")
     pair = pairs[0]
+    bond = pair_bond_context(info, pair, args)
+    j_denominator = energy_denominator(args, 2.0, 2, bond.multiplicity)
+    b_denominator = energy_denominator(args, 1.0, 4, bond.multiplicity)
     jobs: list[dict[str, str]] = []
     states = []
     background_axis = args.background_axis or "z"
@@ -1485,7 +1890,17 @@ def generate_biqua(
             "quantity": "Biquadratic_B_meV",
             "states": states,
             "state_labels": ["E1", "E2", "E3", "E4"],
-            "formula": "B = (E1 + E2 - E3 - E4) * 1000; J = (E1 - E2) * 1000 / 2",
+            "formula": (
+                f"B = prefactor * (E1 + E2 - E3 - E4) * 1000 / {b_denominator:g}; "
+                f"J = prefactor * (E1 - E2) * 1000 / {j_denominator:g}"
+            ),
+            "j_energy_denominator": j_denominator,
+            "b_energy_denominator": b_denominator,
+            "hamiltonian_prefactor": hamiltonian_prefactor(args),
+            "bond_multiplicity": bond.multiplicity,
+            "pair_image_shift": bond.image_shift,
+            "equivalent_pair_shifts": bond.equivalent_shifts,
+            "pair_distance_A": bond.distance,
         }
     ]
 
@@ -1671,8 +2086,8 @@ def extract_energy(path: Path, suffix: str) -> float:
             return float(matches[-1])
     raise FileNotFoundError(f"No energy found in {path} for suffix {suffix}")
 
-def calc_four_state(es):
-    return (es[0] - es[1] - es[2] + es[3]) * 1000.0 / 4.0
+def calc_four_state(es, denominator, prefactor):
+    return prefactor * (es[0] - es[1] - es[2] + es[3]) * 1000.0 / denominator
 
 def collect_stage(root: Path, metadata: dict, stage: dict) -> str:
     base = root / stage["base"] if stage["base"] else root
@@ -1680,9 +2095,12 @@ def collect_stage(root: Path, metadata: dict, stage: dict) -> str:
     lines = [f"# stage {stage['name']}", "# label quantity E1 E2 E3 E4 value_meV"]
     for formula in metadata["formulas"]:
         energies = [extract_energy(base / rel, suffix) for rel in formula["states"]]
+        prefactor = float(formula.get("hamiltonian_prefactor", 1.0))
         if formula["kind"] == "biquadratic":
-            j = (energies[0] - energies[1]) * 1000.0 / 2.0
-            b = (energies[0] + energies[1] - energies[2] - energies[3]) * 1000.0
+            j_denominator = float(formula.get("j_energy_denominator", 2.0))
+            b_denominator = float(formula.get("b_energy_denominator", 1.0))
+            j = prefactor * (energies[0] - energies[1]) * 1000.0 / j_denominator
+            b = prefactor * (energies[0] + energies[1] - energies[2] - energies[3]) * 1000.0 / b_denominator
             lines.append(
                 f"{formula['label']} J_meV {energies[0]:.12f} {energies[1]:.12f} "
                 f"{energies[2]:.12f} {energies[3]:.12f} {j:.8f}"
@@ -1692,7 +2110,8 @@ def collect_stage(root: Path, metadata: dict, stage: dict) -> str:
                 f"{energies[2]:.12f} {energies[3]:.12f} {b:.8f}"
             )
         else:
-            value = calc_four_state(energies)
+            denominator = float(formula.get("energy_denominator", 4.0))
+            value = calc_four_state(energies, denominator, prefactor)
             lines.append(
                 f"{formula['label']} {formula['quantity']} {energies[0]:.12f} {energies[1]:.12f} "
                 f"{energies[2]:.12f} {energies[3]:.12f} {value:.8f}"
@@ -1758,6 +2177,11 @@ def write_metadata(
         "ligand_elements": getattr(args, "ligand_elements", None),
         "magnetic_indices_global_1based": [idx + 1 for idx in mag],
         "moment": args.moment,
+        "hamiltonian_sign": getattr(args, "hamiltonian_sign", "plus"),
+        "spin_convention": getattr(args, "spin_convention", "unit_vector"),
+        "spin_length_S": getattr(args, "spin_length_S", 1.0),
+        "bond_distance_tol_A": getattr(args, "bond_distance_tol", 0.02),
+        "requested_pair_image_shift": getattr(args, "pair_image_shift", None),
         "background_axis_effective": effective_background_axis(kind, args),
         "pair_axis": args.pair_axis,
         "index_mode": args.index_mode,
@@ -1784,8 +2208,9 @@ Files:
 - metadata.json: machine-readable formulas and directory map.
 
 Energy formulas:
-- Jani/Jiso/SIA: value_meV = (E1 - E2 - E3 + E4) * 1000 / 4.
-- Biquadratic: B_meV = (E1 + E2 - E3 - E4) * 1000; J_meV = (E1 - E2) * 1000 / 2.
+- Each formula in metadata.json records the actual denominator, Hamiltonian prefactor, spin convention, and bond multiplicity.
+- SIA diagonal differences use denominator 2; off-diagonal SIA and two-site four-state terms use denominator 4 before spin/multiplicity scaling.
+- Jiso output is the selected axis component Jaa from --pair-axis, not a tensor trace average.
 
 Indexing:
 - input pair/atom labels use the selected index_mode.
@@ -1802,6 +2227,7 @@ def prepare(args: argparse.Namespace) -> None:
     out_root = Path(args.out).resolve()
     if out_root.exists() and any(out_root.iterdir()) and not args.force:
         raise FileExistsError(f"Output directory is not empty: {out_root}. Use --force to write into it.")
+    validate_input_templates(info, args)
     out_root.mkdir(parents=True, exist_ok=True)
 
     pairs: list[PairInfo] = []
@@ -1880,7 +2306,7 @@ def bootstrap(args: argparse.Namespace) -> None:
     sequence = parse_vaspkit_sequence(args.vaspkit_sequence)
     print(f"[INFO] Running {args.vaspkit_command} in {out_dir}")
     subprocess.run([args.vaspkit_command], input=sequence, cwd=out_dir, text=True, check=True)
-    update_bootstrap_incar(out_dir, info, not args.no_ldau)
+    update_bootstrap_incar(out_dir, info, bool(args.ldau and not args.no_ldau))
     missing = [name for name in REQUIRED_INPUTS if not (out_dir / name).exists()]
     if missing:
         print(f"[WARN] vaspkit finished but missing: {', '.join(missing)}", file=sys.stderr)
@@ -1943,6 +2369,26 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--index-mode", choices=["global", "magnetic"], default="global")
     prep.add_argument("--moment", type=float, default=6.0)
     prep.add_argument(
+        "--hamiltonian-sign",
+        choices=["plus", "minus"],
+        default="plus",
+        help="Model convention: plus means H = + coefficient term; minus flips extracted coefficient signs.",
+    )
+    prep.add_argument(
+        "--spin-convention",
+        choices=["unit_vector", "spin_S"],
+        default="unit_vector",
+        help="unit_vector reports coefficients for normalized spin directions; spin_S divides by --spin-length-S powers.",
+    )
+    prep.add_argument("--spin-length-S", type=float, default=1.0, help="Spin length used when --spin-convention spin_S")
+    prep.add_argument("--pair-image-shift", nargs=3, type=int, help="Use this periodic image shift for atom j instead of nearest image")
+    prep.add_argument(
+        "--bond-distance-tol",
+        type=float,
+        default=0.02,
+        help="Distance tolerance in Angstrom for counting equivalent periodic bonds in denominator",
+    )
+    prep.add_argument(
         "--background-axis",
         choices=["x", "y", "z"],
         help="Background spin axis. Defaults by kind: jiso=x, jani/biqua=z; SIA uses component defaults.",
@@ -1953,7 +2399,12 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument(
         "--kitaev-no-component-permutation",
         action="store_true",
-        help="Match ideal Kitaev axes by row order/sign only, reproducing older generated_materials axis1.py behavior",
+        help="Use the legacy discrete row/sign match without Cartesian component permutation",
+    )
+    prep.add_argument(
+        "--allow-kitaev-ligand-fallback",
+        action="store_true",
+        help="Allow nearest-ligand fallback if two shared ligands are not found within --metal-ligand-cutoff",
     )
     prep.add_argument("--workflow", choices=["single", "pbe-hse"], default="single")
     prep.add_argument("--saxis", nargs=3, help="Optional SAXIS values, e.g. --saxis 0 0 1")
@@ -1966,7 +2417,8 @@ def build_parser() -> argparse.ArgumentParser:
     boot.add_argument("--out", required=True)
     boot.add_argument("--vaspkit-command", default="vaspkit")
     boot.add_argument("--vaspkit-sequence", default="1 102 2 0.04")
-    boot.add_argument("--no-ldau", action="store_true", help="Do not apply default LDAU tags after vaspkit")
+    boot.add_argument("--ldau", action="store_true", help="Apply built-in example LDAU tags after vaspkit; review before production")
+    boot.add_argument("--no-ldau", action="store_true", help=argparse.SUPPRESS)
     boot.set_defaults(func=bootstrap)
 
     coll = sub.add_parser("collect", help="Collect energies using metadata.json")
@@ -1984,8 +2436,15 @@ def build_parser() -> argparse.ArgumentParser:
     krep.add_argument(
         "--kitaev-no-component-permutation",
         action="store_true",
-        help="Match ideal Kitaev axes by row order/sign only, reproducing older generated_materials axis1.py behavior",
+        help="Use the legacy discrete row/sign match without Cartesian component permutation",
     )
+    krep.add_argument(
+        "--allow-kitaev-ligand-fallback",
+        action="store_true",
+        help="Allow nearest-ligand fallback if two shared ligands are not found within --metal-ligand-cutoff",
+    )
+    krep.add_argument("--pair-image-shift", nargs=3, type=int, help="Use this periodic image shift for atom j instead of nearest image")
+    krep.add_argument("--bond-distance-tol", type=float, default=0.02)
     krep.add_argument("--jani-root", help="Root of a completed Jani calculation with final_summary.txt")
     krep.add_argument("--stage", help="Stage name in final_summary.txt, e.g. single or hse_no_u")
     krep.add_argument("--out", help="Optional report file")

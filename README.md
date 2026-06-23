@@ -7,25 +7,25 @@ This is a Codex / Claude Code skill for VASP four-state magnetic-interaction wor
 ## 功能概览
 
 - `neighbors`: 给定 POSCAR 后，列出 10 A 或指定 cutoff 内的所有磁性原子近邻，按壳层给出代表 pair，并提示周期边界和扩包风险。
-- `bootstrap`: 在没有完整 VASP 输入模板时调用 `vaspkit` 生成 `INCAR`、`KPOINTS`、`POTCAR`、`POSCAR` 模板，并补充常用 LDAU/RWIGS 设置。
+- `bootstrap`: 在没有完整 VASP 输入模板时调用 `vaspkit` 生成 `INCAR`、`KPOINTS`、`POTCAR`、`POSCAR` 模板，默认只补充可从 POTCAR 读取的 `RWIGS`；经验 `LDAU` 需显式 `--ldau`。
 - `prepare --kind jani`: 为指定 pair 生成各向异性交换张量 `Jab` 的四态法目录。
-- `prepare --kind jiso`: 为一个或多个 pair 生成各向同性交换 `Jiso` 的四态法目录。
+- `prepare --kind jiso`: 为一个或多个 pair 生成指定轴向交换 `Jaa` 的四态法目录；真正的 trace-average isotropic 值建议由完整 `jani` 张量得到。
 - `prepare --kind sia`: 为指定磁性原子生成单离子各向异性 `SIA` 的四态法目录。
 - `prepare --kind biqua`: 为指定 pair 生成 biquadratic 相互作用目录。
 - `prepare --kind kitaev`: 根据共享配体和八面体方向识别 Kitaev `x/y/z` 轴，选择当前键的 `gamma` 轴并生成四态目录。
-- `kitaev-report`: 将已完成的 Jani 张量旋转到 Kitaev 局域坐标，输出 `K_gamma_minus_alpha_beta_avg_meV` 等指标。
+- `kitaev-report`: 将已完成的 Jani 张量旋转到两端 Kitaev 局域坐标，输出 `K_gamma_minus_alpha_beta_avg_meV`、`Gamma`、`Gamma'` 和 DMI 等指标。
 - `collect`: 收集 VASP 完成后的能量并写出 `final_summary.txt`。
 
 ## Feature Summary
 
 - `neighbors`: list all magnetic-neighbor contacts within a cutoff, group them into shells, choose representative pairs, and warn about boundary/supercell issues.
-- `bootstrap`: call `vaspkit` to create reusable VASP input templates when `INCAR`, `KPOINTS`, `POTCAR`, and `POSCAR` are not already available.
+- `bootstrap`: call `vaspkit` to create reusable VASP input templates; it fills POTCAR-derived `RWIGS` by default, while example `LDAU` tags require explicit `--ldau`.
 - `prepare --kind jani`: generate four-state anisotropic exchange tensor calculations.
-- `prepare --kind jiso`: generate four-state isotropic exchange calculations.
+- `prepare --kind jiso`: generate four-state exchange calculations for the selected axis component `Jaa`; use full `jani` for a trace-average isotropic value.
 - `prepare --kind sia`: generate single-ion anisotropy calculations.
 - `prepare --kind biqua`: generate biquadratic interaction calculations.
 - `prepare --kind kitaev`: detect octahedral Kitaev axes from shared ligands and generate the selected `gamma` projection.
-- `kitaev-report`: rotate a completed Jani tensor into the matched Kitaev local frame.
+- `kitaev-report`: rotate a completed Jani tensor into the two-site matched Kitaev local frame and report `K`, `Gamma`, `Gamma'`, and DMI components.
 - `collect`: extract final VASP energies and write `final_summary.txt`.
 
 ## 目录结构
@@ -39,8 +39,10 @@ four-state-vasp/
 ├── references/
 │   ├── methods.md
 │   └── bibliography.bib
-└── scripts/
-    └── four_state_vasp.py
+├── scripts/
+│   └── four_state_vasp.py
+└── tests/
+    └── test_core.py
 ```
 
 `SKILL.md` 是 agent 入口说明；`scripts/four_state_vasp.py` 是实际生成和后处理脚本；`references/methods.md` 记录公式、状态定义和旧脚本来源；`references/bibliography.bib` 提供可复制的文献引用。
@@ -151,7 +153,7 @@ or ask naturally and let Claude Code load the skill when relevant.
 ## 基本依赖
 
 - Python 3.10 或更新版本。
-- VASP 输入模板目录，至少包含 `INCAR`、`KPOINTS`、`POSCAR`、`POTCAR`。
+- VASP 输入模板目录，至少包含 `INCAR`、`KPOINTS`、`POSCAR`、`POTCAR`；四态约束计算会检查正的 `LAMBDA` 和足够的 `RWIGS`。
 - `vaspkit` 可选，仅在需要 `bootstrap` 自动生成输入模板时使用。
 - `bash`，用于运行生成的 `submit_all.sh`、`run_state.sh`、`postprocess.sh`。
 - VASP 与集群提交环境由用户本地系统提供。
@@ -161,7 +163,7 @@ or ask naturally and let Claude Code load the skill when relevant.
 ## Requirements
 
 - Python 3.10 or newer.
-- A VASP input template directory containing `INCAR`, `KPOINTS`, `POSCAR`, and `POTCAR`.
+- A VASP input template directory containing `INCAR`, `KPOINTS`, `POSCAR`, and `POTCAR`; constrained four-state runs require positive `LAMBDA` and enough positive `RWIGS` values.
 - Optional `vaspkit` for `bootstrap`.
 - `bash` for generated submission and postprocessing scripts.
 - VASP and the cluster scheduler are provided by your local/HPC environment.
@@ -205,6 +207,8 @@ python3 scripts/four_state_vasp.py bootstrap \
 
 如果已有 `INCAR/KPOINTS/POSCAR/POTCAR` 模板目录，可以跳过这一步。
 
+`bootstrap` 默认不会再写经验 `LDAU`，只会尝试从 `POTCAR` 提取 `RWIGS`。需要内置示例 U 值时显式加 `--ldau`，正式计算前请自行检查。
+
 ### 3. Jani
 
 ```bash
@@ -238,7 +242,7 @@ python3 scripts/four_state_vasp.py prepare \
   --workflow pbe-hse
 ```
 
-默认非 pair 磁性原子沿 `x`，选中 pair 沿 `z` 做 `upup/updn/dnup/dndn`。
+默认非 pair 磁性原子沿 `x`，选中 pair 沿 `z` 做 `upup/updn/dnup/dndn`。输出量名为所选轴向的 `Jzz_meV`（或 `Jxx/Jyy`），不是三轴 trace 平均的 `Jiso`。
 
 ### 5. SIA
 
@@ -254,7 +258,7 @@ python3 scripts/four_state_vasp.py prepare \
   --workflow pbe-hse
 ```
 
-输出 `Axy Axz Ayz Ayy_minus_Axx Azz_minus_Axx`。
+输出 `Axy Axz Ayz Ayy_minus_Axx Azz_minus_Axx`。对角差分项的分母为 2，非对角项为 4，实际分母和 spin/multiplicity 约定写在 `metadata.json`。
 
 ### 6. Biquadratic
 
@@ -288,11 +292,12 @@ python3 scripts/four_state_vasp.py prepare \
 Kitaev 轴识别默认使用 `4.5 A` 金属-配体 cutoff。脚本会：
 
 1. 找到选中金属 pair 的最近周期 image。
-2. 搜索共享配体；不足两个时用 nearest-six 和距离和 fallback。
-3. 用共享边配体建立 pair reference basis。
-4. 用附近八面体配体方向稳定手性。
-5. 将理想 Kitaev `x/y/z` 轴通过行/符号和笛卡尔分量置换匹配到局域结构。
-6. 选择与金属-金属键最垂直的轴作为 `gamma`。
+2. 搜索 cutoff 内同时键合两端金属的两个共享配体；默认找不到会报错，避免错误配体静默进入计算。
+3. 分别为 pair 两端建立局域 reference basis，并用附近八面体配体方向稳定手性。
+4. 将理想 Kitaev `x/y/z` 轴连续投影到局域 reference basis；报告两端轴的一致性角度。
+5. 选择与金属-金属键最垂直的轴作为 `gamma`。
+
+仅做探索时可用 `--allow-kitaev-ligand-fallback` 恢复 nearest-six/distance-sum fallback。
 
 如需复现旧的 generated_materials material-specific `axis1.py` 行/符号匹配方式：
 
@@ -446,12 +451,13 @@ Always inspect `pair_indexing.tsv`, `sia_target.tsv`, and `metadata.json` after 
 1. 对 pair 先做完整 `jani`。
 2. VASP 完成后 `collect`。
 3. 运行 `kitaev-report --jani-root <jani-root>`。
-4. 优先查看 `K_gamma_minus_alpha_beta_avg_meV`；也可同时比较 `K_gamma_minus_trace_iso_meV`。
+4. 优先查看 `K_gamma_minus_alpha_beta_avg_meV`；同时检查 `traceless_gamma_anisotropy_meV`、`Gamma_alpha_beta_meV`、`Gamma_prime_avg_meV` 和 DMI 分量。
 
 ## Notes
 
 - Generated energies are reported in meV.
 - `--workflow pbe-hse` creates both PBE+U preconvergence and HSE no-U directories.
+- `kitaev-report` requires `--stage` when a `final_summary.txt` contains multiple stages such as `pbe_pre` and `hse_no_u`.
 - `prepare --kind kitaev` directly computes the selected `J_gamma_gamma` projection. For a more complete Kitaev anisotropy estimate, run full `jani` first and then `kitaev-report`.
 - The methods and state formulas are documented in `references/methods.md`.
 
