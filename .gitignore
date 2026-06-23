@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# VASP licensed inputs and large outputs
+POTCAR
+*/POTCAR
+WAVECAR
+*/WAVECAR
+CHGCAR
+*/CHGCAR
+CHG
+*/CHG
+AECCAR*
+*/AECCAR*
+vasprun.xml
+*/vasprun.xml
+OUTCAR
+*/OUTCAR
+OSZICAR
+*/OSZICAR
+EIGENVAL
+*/EIGENVAL
+PROCAR
+*/PROCAR
+DOSCAR
+*/DOSCAR
+IBZKPT
+*/IBZKPT
+REPORT
+*/REPORT
+XDATCAR
+*/XDATCAR
+
+# Common generated calculation roots
+neighbor_analysis/
+pair_*_jani/
+jiso_pairs/
+sia_*/
+biqua_pair_*/
+kitaev_pair_*/
+

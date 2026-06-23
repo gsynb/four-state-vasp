@@ -1,0 +1,2008 @@
+#!/usr/bin/env python3
+"""
+Prepare and postprocess VASP four-state magnetic-interaction calculations.
+
+This script is intentionally dependency-light so it can run on login nodes where
+only Python and the usual VASP/Slurm tools are available.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+from dataclasses import dataclass, replace
+from itertools import combinations, permutations, product
+from pathlib import Path
+from typing import Iterable
+
+
+JANI_COMPONENTS = ["Jxx", "Jxy", "Jyy", "Jyz", "Jzz", "Jzx", "Jxz", "Jyx", "Jzy"]
+SIA_COMPONENTS = ["Axy", "Axz", "Ayz", "Ayy_minus_Axx", "Azz_minus_Axx"]
+JISO_SPINS = ["upup", "updn", "dnup", "dndn"]
+STAGE_SINGLE = [{"name": "single", "base": "", "suffix": "single"}]
+STAGE_PBE_HSE = [
+    {"name": "hse_no_u", "base": "", "suffix": "hse_no_u"},
+    {"name": "pbe_pre", "base": "pbe", "suffix": "pbe_pre"},
+]
+REQUIRED_INPUTS = ["INCAR", "KPOINTS", "POSCAR", "POTCAR"]
+AXIS = {
+    "x": (1.0, 0.0, 0.0),
+    "y": (0.0, 1.0, 0.0),
+    "z": (0.0, 0.0, 1.0),
+}
+KITAEV_AXIS_LABELS = ("x", "y", "z")
+IDEAL_KITAEV_BASIS = (
+    (-(6.0**0.5) / 3.0, 0.0, (3.0**0.5) / 3.0),
+    ((6.0**0.5) / 6.0, (2.0**0.5) / 2.0, (3.0**0.5) / 3.0),
+    ((6.0**0.5) / 6.0, -(2.0**0.5) / 2.0, (3.0**0.5) / 3.0),
+)
+DEFAULT_U = {
+    "Ag": 1.5,
+    "Co": 3.4,
+    "Cr": 3.5,
+    "Cu": 4.0,
+    "Fe": 4.0,
+    "Mn": 3.9,
+    "Mo": 3.5,
+    "Nb": 1.5,
+    "Ni": 6.0,
+    "Rh": 3.0,
+    "V": 3.1,
+}
+
+
+@dataclass(frozen=True)
+class PoscarInfo:
+    path: Path
+    elements: list[str]
+    counts: list[int]
+    atom_symbols: list[str]
+    lattice: list[tuple[float, float, float]]
+    frac_coords: list[tuple[float, float, float]]
+
+    @property
+    def natoms(self) -> int:
+        return len(self.atom_symbols)
+
+
+@dataclass(frozen=True)
+class PairInfo:
+    label_i: int
+    label_j: int
+    global_i: int
+    global_j: int
+    magnetic_i: int
+    magnetic_j: int
+
+    @property
+    def label(self) -> str:
+        return f"pair_{self.label_i}_{self.label_j}"
+
+
+@dataclass(frozen=True)
+class NeighborContact:
+    shell: int
+    distance: float
+    i_global: int
+    j_global: int
+    i_mag: int
+    j_mag: int
+    image_shift: tuple[int, int, int]
+    disp_frac: tuple[float, float, float]
+    disp_cart: tuple[float, float, float]
+
+    @property
+    def crosses_boundary(self) -> bool:
+        return any(self.image_shift)
+
+    @property
+    def pair_label(self) -> str:
+        return f"pair_{self.i_global + 1}_{self.j_global + 1}"
+
+
+@dataclass(frozen=True)
+class KitaevFrame:
+    pair: PairInfo
+    gamma_axis: tuple[float, float, float]
+    local_x: tuple[float, float, float]
+    local_y: tuple[float, float, float]
+    bond_axis: tuple[float, float, float]
+    pair_shift: tuple[int, int, int]
+    shared_ligands: list[tuple[int, tuple[int, int, int], float, float]]
+    gamma_label: str
+    alpha_label: str
+    beta_label: str
+    kitaev_axes: list[tuple[str, tuple[float, float, float]]]
+    reference_basis: list[tuple[float, float, float]]
+    axis_overlaps: tuple[float, float, float]
+    axis_bond_dots: tuple[float, float, float]
+    ligand_method: str
+    axis_match: str
+    octahedral_ligands: list[tuple[int, tuple[int, int, int], float]]
+    octahedral_angle_error: float | None
+
+
+def is_int_token(token: str) -> bool:
+    try:
+        int(token)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_vec3(line: str, context: str) -> tuple[float, float, float]:
+    parts = line.split()
+    if len(parts) < 3:
+        raise ValueError(f"Expected three numbers for {context}: {line!r}")
+    try:
+        return (float(parts[0]), float(parts[1]), float(parts[2]))
+    except ValueError as exc:
+        raise ValueError(f"Bad numeric vector for {context}: {line!r}") from exc
+
+
+def vec_add(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    ax, ay, az = a
+    bx, by, bz = b
+    return (float(ax) + float(bx), float(ay) + float(by), float(az) + float(bz))
+
+
+def vec_sub(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    ax, ay, az = a
+    bx, by, bz = b
+    return (float(ax) - float(bx), float(ay) - float(by), float(az) - float(bz))
+
+
+def vec_scale(a: Iterable[float], scale: float) -> tuple[float, float, float]:
+    ax, ay, az = a
+    return (float(ax) * scale, float(ay) * scale, float(az) * scale)
+
+
+def vec_dot(a: Iterable[float], b: Iterable[float]) -> float:
+    ax, ay, az = a
+    bx, by, bz = b
+    return float(ax) * float(bx) + float(ay) * float(by) + float(az) * float(bz)
+
+
+def vec_cross(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    ax, ay, az = a
+    bx, by, bz = b
+    return (
+        float(ay) * float(bz) - float(az) * float(by),
+        float(az) * float(bx) - float(ax) * float(bz),
+        float(ax) * float(by) - float(ay) * float(bx),
+    )
+
+
+def vec_norm(a: Iterable[float]) -> float:
+    return math.sqrt(vec_dot(a, a))
+
+
+def vec_normalize(a: Iterable[float], label: str = "vector") -> tuple[float, float, float]:
+    length = vec_norm(a)
+    if length < 1e-12:
+        raise ValueError(f"Cannot normalize near-zero {label}")
+    return tuple(float(x) / length for x in a)  # type: ignore[return-value]
+
+
+def det3(rows: list[tuple[float, float, float]]) -> float:
+    a, b, c = rows
+    return vec_dot(a, vec_cross(b, c))
+
+
+def inverse_lattice_rows(lattice: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    a, b, c = lattice
+    volume = det3(lattice)
+    if abs(volume) < 1e-12:
+        raise ValueError("POSCAR lattice is singular")
+    # Columns of the inverse row-lattice transform are reciprocal dual vectors.
+    dual_a = vec_scale(vec_cross(b, c), 1.0 / volume)
+    dual_b = vec_scale(vec_cross(c, a), 1.0 / volume)
+    dual_c = vec_scale(vec_cross(a, b), 1.0 / volume)
+    return [dual_a, dual_b, dual_c]
+
+
+def frac_to_cart(frac: Iterable[float], lattice: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+    f0, f1, f2 = frac
+    a, b, c = lattice
+    return (
+        float(f0) * a[0] + float(f1) * b[0] + float(f2) * c[0],
+        float(f0) * a[1] + float(f1) * b[1] + float(f2) * c[1],
+        float(f0) * a[2] + float(f1) * b[2] + float(f2) * c[2],
+    )
+
+
+def cart_to_frac(cart: Iterable[float], lattice: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+    dual = inverse_lattice_rows(lattice)
+    return (vec_dot(cart, dual[0]), vec_dot(cart, dual[1]), vec_dot(cart, dual[2]))
+
+
+def nearest_int(value: float) -> int:
+    return int(math.floor(value + 0.5)) if value >= 0 else int(math.ceil(value - 0.5))
+
+
+def nearest_image_delta(
+    frac_i: tuple[float, float, float],
+    frac_j: tuple[float, float, float],
+) -> tuple[tuple[float, float, float], tuple[int, int, int]]:
+    raw = vec_sub(frac_j, frac_i)
+    shift = tuple(-nearest_int(x) for x in raw)  # type: ignore[assignment]
+    wrapped = (raw[0] + shift[0], raw[1] + shift[1], raw[2] + shift[2])
+    return wrapped, shift  # type: ignore[return-value]
+
+
+def lattice_heights(lattice: list[tuple[float, float, float]]) -> list[float]:
+    a, b, c = lattice
+    volume = abs(det3(lattice))
+    areas = [vec_norm(vec_cross(b, c)), vec_norm(vec_cross(c, a)), vec_norm(vec_cross(a, b))]
+    return [volume / area if area > 1e-12 else 0.0 for area in areas]
+
+
+def parse_lattice_scale(
+    scale_line: str,
+    raw_lattice: list[tuple[float, float, float]],
+) -> tuple[list[tuple[float, float, float]], tuple[float, float, float]]:
+    tokens = [float(tok) for tok in scale_line.split()]
+    if not tokens:
+        raise ValueError("POSCAR scale line is empty")
+    if len(tokens) == 1:
+        scale = tokens[0]
+        if scale < 0:
+            raw_volume = abs(det3(raw_lattice))
+            if raw_volume < 1e-12:
+                raise ValueError("Cannot use negative POSCAR volume scale with singular lattice")
+            scale = ((-scale) / raw_volume) ** (1.0 / 3.0)
+        lattice = [vec_scale(vec, scale) for vec in raw_lattice]
+        return lattice, (scale, scale, scale)
+    if len(tokens) == 3:
+        sx, sy, sz = tokens
+        lattice = [(x * sx, y * sy, z * sz) for x, y, z in raw_lattice]
+        return lattice, (sx, sy, sz)
+    raise ValueError(f"Unsupported POSCAR scale line: {scale_line!r}")
+
+
+def read_poscar(path: Path) -> PoscarInfo:
+    lines = path.read_text().splitlines()
+    if len(lines) < 8:
+        raise ValueError(f"POSCAR is too short: {path}")
+    raw_lattice = [parse_vec3(lines[idx], f"lattice vector {idx - 1}") for idx in range(2, 5)]
+    lattice, cart_scale = parse_lattice_scale(lines[1], raw_lattice)
+    line5 = lines[5].split()
+    line6 = lines[6].split()
+    if not line5:
+        raise ValueError("POSCAR element/count line is empty")
+    if all(is_int_token(tok) for tok in line5):
+        counts = [int(tok) for tok in line5]
+        counts_idx = 5
+        comment_symbols = lines[0].split()
+        if len(comment_symbols) == len(counts) and all(re.fullmatch(r"[A-Z][a-z]?", tok) for tok in comment_symbols):
+            elements = comment_symbols
+        else:
+            elements = [f"X{i + 1}" for i in range(len(counts))]
+    else:
+        elements = line5
+        if not line6 or not all(is_int_token(tok) for tok in line6):
+            raise ValueError("POSCAR does not look like VASP 5 format with element names")
+        counts = [int(tok) for tok in line6]
+        counts_idx = 6
+    if len(elements) != len(counts):
+        raise ValueError(f"Element/count mismatch in POSCAR: {elements} vs {counts}")
+    atom_symbols: list[str] = []
+    for elem, count in zip(elements, counts):
+        atom_symbols.extend([elem] * count)
+    coord_idx = counts_idx + 1
+    if coord_idx >= len(lines):
+        raise ValueError("POSCAR is missing coordinate mode line")
+    if lines[coord_idx].strip().lower().startswith("s"):
+        coord_idx += 1
+    if coord_idx >= len(lines):
+        raise ValueError("POSCAR is missing coordinate mode line after Selective dynamics")
+    coord_mode = lines[coord_idx].strip().lower()
+    coord_start = coord_idx + 1
+    if len(lines) < coord_start + len(atom_symbols):
+        raise ValueError("POSCAR does not contain enough coordinate rows")
+    frac_coords: list[tuple[float, float, float]] = []
+    for atom_idx in range(len(atom_symbols)):
+        raw = parse_vec3(lines[coord_start + atom_idx], f"atom {atom_idx + 1} coordinate")
+        if coord_mode.startswith("d"):
+            frac = raw
+        elif coord_mode.startswith("c") or coord_mode.startswith("k"):
+            cart = (raw[0] * cart_scale[0], raw[1] * cart_scale[1], raw[2] * cart_scale[2])
+            frac = cart_to_frac(cart, lattice)
+        else:
+            raise ValueError(f"Unsupported POSCAR coordinate mode: {lines[coord_idx]!r}")
+        frac_coords.append(tuple(x % 1.0 for x in frac))  # type: ignore[arg-type]
+    return PoscarInfo(
+        path=path,
+        elements=elements,
+        counts=counts,
+        atom_symbols=atom_symbols,
+        lattice=lattice,
+        frac_coords=frac_coords,
+    )
+
+
+def magnetic_indices(info: PoscarInfo, elems: list[str] | None) -> list[int]:
+    if not elems:
+        elems = [info.elements[0]]
+        print(f"[WARN] --magnetic-elements not set; using first POSCAR element: {elems[0]}", file=sys.stderr)
+    missing = [elem for elem in elems if elem not in info.elements]
+    if missing:
+        raise ValueError(f"Magnetic element(s) not in POSCAR: {', '.join(missing)}")
+    return [idx for idx, elem in enumerate(info.atom_symbols) if elem in elems]
+
+
+def one_based_to_global(idx: int, mode: str, mag: list[int], natoms: int) -> tuple[int, int]:
+    if idx <= 0:
+        raise ValueError("Atom indices are 1-based and must be positive")
+    if mode == "global":
+        global_idx = idx - 1
+        if global_idx < 0 or global_idx >= natoms:
+            raise ValueError(f"Global atom index {idx} outside 1..{natoms}")
+        if global_idx not in mag:
+            raise ValueError(f"Global atom index {idx} is not in the selected magnetic atom list")
+        mag_ord = mag.index(global_idx) + 1
+        return global_idx, mag_ord
+    if mode == "magnetic":
+        if idx > len(mag):
+            raise ValueError(f"Magnetic atom index {idx} outside 1..{len(mag)}")
+        return mag[idx - 1], idx
+    raise ValueError(f"Unknown index mode: {mode}")
+
+
+def make_pair(i: int, j: int, mode: str, mag: list[int], natoms: int) -> PairInfo:
+    gi, mi = one_based_to_global(i, mode, mag, natoms)
+    gj, mj = one_based_to_global(j, mode, mag, natoms)
+    if gi == gj:
+        raise ValueError("Pair atoms must be different")
+    return PairInfo(label_i=i, label_j=j, global_i=gi, global_j=gj, magnetic_i=mi, magnetic_j=mj)
+
+
+def parse_pairs(raw_pairs: list[str], mode: str, mag: list[int], natoms: int) -> list[PairInfo]:
+    pairs: list[PairInfo] = []
+    for raw in raw_pairs:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            match = re.fullmatch(r"(\d+)\s*[-:]\s*(\d+)", item)
+            if not match:
+                raise ValueError(f"Bad pair format '{item}'. Use I-J or repeat --pair I-J.")
+            pairs.append(make_pair(int(match.group(1)), int(match.group(2)), mode, mag, natoms))
+    return pairs
+
+
+def atom_label(info: PoscarInfo, global_idx: int) -> str:
+    return f"{info.atom_symbols[global_idx]}{global_idx + 1}"
+
+
+def magnetic_ord(mag: list[int], global_idx: int) -> int:
+    return mag.index(global_idx) + 1 if global_idx in mag else 0
+
+
+def translation_search_extent(info: PoscarInfo, cutoff: float) -> int:
+    lengths = [vec_norm(vec) for vec in info.lattice]
+    heights = [height for height in lattice_heights(info.lattice) if height > 1e-12]
+    scale = min(lengths + heights)
+    if scale <= 1e-12:
+        raise ValueError("Cannot determine POSCAR cell size")
+    return max(1, int(math.ceil(cutoff / scale)) + 1)
+
+
+def cluster_contacts(contacts: list[NeighborContact], shell_tol: float) -> list[NeighborContact]:
+    sorted_contacts = sorted(contacts, key=lambda c: (c.distance, c.i_global, c.j_global, c.image_shift))
+    shell_refs: list[float] = []
+    assigned: list[NeighborContact] = []
+    for contact in sorted_contacts:
+        shell = None
+        for idx, ref in enumerate(shell_refs, start=1):
+            if abs(contact.distance - ref) <= shell_tol:
+                shell = idx
+                break
+        if shell is None:
+            shell_refs.append(contact.distance)
+            shell = len(shell_refs)
+        assigned.append(replace(contact, shell=shell))
+    return assigned
+
+
+def find_neighbor_contacts(
+    info: PoscarInfo,
+    mag: list[int],
+    cutoff: float,
+    shell_tol: float,
+) -> list[NeighborContact]:
+    extent = translation_search_extent(info, cutoff)
+    contacts: list[NeighborContact] = []
+    for pos_i, i_global in enumerate(mag):
+        for j_global in mag[pos_i + 1 :]:
+            for tx in range(-extent, extent + 1):
+                for ty in range(-extent, extent + 1):
+                    for tz in range(-extent, extent + 1):
+                        shift = (tx, ty, tz)
+                        disp_frac = (
+                            info.frac_coords[j_global][0] + tx - info.frac_coords[i_global][0],
+                            info.frac_coords[j_global][1] + ty - info.frac_coords[i_global][1],
+                            info.frac_coords[j_global][2] + tz - info.frac_coords[i_global][2],
+                        )
+                        disp_cart = frac_to_cart(disp_frac, info.lattice)
+                        distance = vec_norm(disp_cart)
+                        if distance < 1e-8 or distance > cutoff:
+                            continue
+                        contacts.append(
+                            NeighborContact(
+                                shell=0,
+                                distance=distance,
+                                i_global=i_global,
+                                j_global=j_global,
+                                i_mag=magnetic_ord(mag, i_global),
+                                j_mag=magnetic_ord(mag, j_global),
+                                image_shift=shift,
+                                disp_frac=disp_frac,
+                                disp_cart=disp_cart,
+                            )
+                        )
+    return cluster_contacts(contacts, shell_tol)
+
+
+def find_self_image_contacts(info: PoscarInfo, mag: list[int], cutoff: float) -> list[tuple[int, tuple[int, int, int], float]]:
+    extent = translation_search_extent(info, cutoff)
+    contacts: list[tuple[int, tuple[int, int, int], float]] = []
+    for global_idx in mag:
+        for tx in range(-extent, extent + 1):
+            for ty in range(-extent, extent + 1):
+                for tz in range(-extent, extent + 1):
+                    shift = (tx, ty, tz)
+                    if shift == (0, 0, 0):
+                        continue
+                    disp_cart = frac_to_cart(shift, info.lattice)
+                    distance = vec_norm(disp_cart)
+                    if 1e-8 < distance <= cutoff:
+                        contacts.append((global_idx, shift, distance))
+    return sorted(contacts, key=lambda item: item[2])
+
+
+def default_center_atom(info: PoscarInfo, mag: list[int]) -> int:
+    center = (0.5, 0.5, 0.5)
+    return min(mag, key=lambda idx: vec_dot(vec_sub(info.frac_coords[idx], center), vec_sub(info.frac_coords[idx], center)))
+
+
+def representative_contacts(contacts: list[NeighborContact], center_global: int | None) -> list[NeighborContact]:
+    reps: list[NeighborContact] = []
+    for shell in sorted({contact.shell for contact in contacts}):
+        group = [contact for contact in contacts if contact.shell == shell]
+        candidates = group
+        if center_global is not None:
+            centered = [c for c in group if c.i_global == center_global or c.j_global == center_global]
+            if centered:
+                candidates = centered
+        nonboundary = [c for c in candidates if not c.crosses_boundary]
+        reps.append(sorted(nonboundary or candidates, key=lambda c: (c.distance, c.crosses_boundary, c.i_global, c.j_global))[0])
+    return reps
+
+
+def suggested_expansion_for_radius(info: PoscarInfo, radius: float, margin: float) -> list[int]:
+    needed = 2.0 * radius + margin
+    mults: list[int] = []
+    for height in lattice_heights(info.lattice):
+        if height <= 1e-12:
+            mults.append(1)
+        else:
+            mults.append(max(1, int(math.ceil(needed / height))))
+    return mults
+
+
+def neighbor_warnings(
+    info: PoscarInfo,
+    contacts: list[NeighborContact],
+    self_contacts: list[tuple[int, tuple[int, int, int], float]],
+    center_global: int | None,
+    margin: float,
+) -> list[str]:
+    warnings: list[str] = []
+    if self_contacts:
+        atom, shift, distance = self_contacts[0]
+        warnings.append(
+            f"Periodic self-image within cutoff: {atom_label(info, atom)} shift={shift} distance={distance:.4f} A. "
+            "This is a finite-size warning for long-range exchange."
+        )
+    for shell in sorted({contact.shell for contact in contacts}):
+        group = [contact for contact in contacts if contact.shell == shell]
+        radius = sum(c.distance for c in group) / len(group)
+        mults = suggested_expansion_for_radius(info, radius, margin)
+        if any(mult > 1 for mult in mults):
+            warnings.append(
+                f"Shell {shell} at {radius:.4f} A may need a larger supercell for a centered four-state pair; "
+                f"heuristic minimum expansion is {mults[0]}x{mults[1]}x{mults[2]}."
+            )
+        if center_global is not None:
+            centered = [c for c in group if c.i_global == center_global or c.j_global == center_global]
+            centered_boundary = [c for c in centered if c.crosses_boundary]
+            if centered_boundary:
+                warnings.append(
+                    f"Shell {shell}: {len(centered_boundary)}/{len(centered)} contacts around center "
+                    f"{atom_label(info, center_global)} cross the periodic boundary. "
+                    "Do not skip this shell by choosing only in-cell pairs; enlarge the cell or choose a more central equivalent."
+                )
+        if group and all(c.crosses_boundary for c in group):
+            warnings.append(
+                f"Shell {shell}: every contact uses a periodic image. The current cell is too small for an in-cell representative pair."
+            )
+    return warnings
+
+
+def format_shift(shift: tuple[int, int, int]) -> str:
+    return f"{shift[0]},{shift[1]},{shift[2]}"
+
+
+def write_neighbor_outputs(
+    out_dir: Path,
+    info: PoscarInfo,
+    contacts: list[NeighborContact],
+    reps: list[NeighborContact],
+    warnings: list[str],
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    contact_lines = [
+        "shell\tdistance_A\tpair\tglobal_i\tglobal_j\tmagnetic_i\tmagnetic_j\timage_shift_j\tdx_A\tdy_A\tdz_A\tcrosses_boundary\n"
+    ]
+    for c in contacts:
+        contact_lines.append(
+            f"{c.shell}\t{c.distance:.8f}\t{c.pair_label}\t{c.i_global + 1}\t{c.j_global + 1}\t"
+            f"{c.i_mag}\t{c.j_mag}\t{format_shift(c.image_shift)}\t"
+            f"{c.disp_cart[0]:.8f}\t{c.disp_cart[1]:.8f}\t{c.disp_cart[2]:.8f}\t{int(c.crosses_boundary)}\n"
+        )
+    (out_dir / "neighbor_contacts.tsv").write_text("".join(contact_lines))
+    rep_lines = ["shell\tdistance_A\trepresentative_pair\tglobal_i\tglobal_j\timage_shift_j\tcrosses_boundary\n"]
+    for c in reps:
+        rep_lines.append(
+            f"{c.shell}\t{c.distance:.8f}\t{c.pair_label}\t{c.i_global + 1}\t{c.j_global + 1}\t"
+            f"{format_shift(c.image_shift)}\t{int(c.crosses_boundary)}\n"
+        )
+    (out_dir / "neighbor_representatives.tsv").write_text("".join(rep_lines))
+    (out_dir / "supercell_warnings.txt").write_text("\n".join(warnings) + ("\n" if warnings else ""))
+
+
+def neighbors(args: argparse.Namespace) -> None:
+    info = read_poscar(Path(args.poscar))
+    mag = magnetic_indices(info, args.magnetic_elements)
+    if args.center_atom:
+        center_global, _ = one_based_to_global(args.center_atom, args.index_mode, mag, info.natoms)
+    else:
+        center_global = default_center_atom(info, mag)
+    contacts = find_neighbor_contacts(info, mag, args.cutoff, args.shell_tol)
+    self_contacts = find_self_image_contacts(info, mag, args.cutoff)
+    reps = representative_contacts(contacts, center_global)
+    warnings = neighbor_warnings(info, contacts, self_contacts, center_global, args.boundary_margin)
+
+    print(f"# POSCAR: {Path(args.poscar).resolve()}")
+    print(f"# Magnetic elements: {', '.join(args.magnetic_elements or [info.elements[0]])}")
+    print(f"# Magnetic atoms global: {' '.join(str(idx + 1) for idx in mag)}")
+    print(f"# Cell heights A: {' '.join(f'{height:.4f}' for height in lattice_heights(info.lattice))}")
+    print(f"# Center atom for representatives: {atom_label(info, center_global)} (global {center_global + 1}, magnetic {magnetic_ord(mag, center_global)})")
+    print(f"\nRepresentative shells within {args.cutoff:.2f} A:")
+    print("shell distance_A count boundary_count representative_pair image_shift_j suggested_expansion")
+    for rep in reps:
+        group = [c for c in contacts if c.shell == rep.shell]
+        boundary_count = sum(1 for c in group if c.crosses_boundary)
+        mults = suggested_expansion_for_radius(info, rep.distance, args.boundary_margin)
+        print(
+            f"{rep.shell} {rep.distance:.4f} {len(group)} {boundary_count} {rep.pair_label} "
+            f"{format_shift(rep.image_shift)} {mults[0]}x{mults[1]}x{mults[2]}"
+        )
+    print(f"\nAll magnetic-pair contacts within {args.cutoff:.2f} A:")
+    print("shell distance_A pair global_i global_j magnetic_i magnetic_j image_shift_j boundary")
+    for row_no, c in enumerate(contacts, start=1):
+        if row_no > args.max_rows:
+            print(f"... truncated at {args.max_rows} rows; use --out to write full TSV.")
+            break
+        print(
+            f"{c.shell} {c.distance:.4f} {c.pair_label} {c.i_global + 1} {c.j_global + 1} "
+            f"{c.i_mag} {c.j_mag} {format_shift(c.image_shift)} {int(c.crosses_boundary)}"
+        )
+    if warnings:
+        print("\nSupercell warnings:")
+        for warning in warnings:
+            print(f"- {warning}")
+    else:
+        print("\nSupercell warnings: none from the current heuristic.")
+    if args.out:
+        write_neighbor_outputs(Path(args.out), info, contacts, reps, warnings)
+        print(f"\n[OK] Wrote neighbor analysis to {Path(args.out).resolve()}")
+
+
+def ligand_indices(info: PoscarInfo, mag: list[int], ligand_elements: list[str] | None) -> list[int]:
+    if ligand_elements:
+        missing = [elem for elem in ligand_elements if elem not in info.elements]
+        if missing:
+            raise ValueError(f"Ligand element(s) not in POSCAR: {', '.join(missing)}")
+        return [idx for idx, elem in enumerate(info.atom_symbols) if elem in ligand_elements]
+    mag_set = set(mag)
+    ligands = [idx for idx in range(info.natoms) if idx not in mag_set]
+    if not ligands:
+        raise ValueError("No ligand atoms inferred; pass --ligand-elements explicitly")
+    return ligands
+
+
+def canonical_direction(vec: Iterable[float]) -> tuple[float, float, float]:
+    unit = vec_normalize(vec)
+    max_idx = max(range(3), key=lambda idx: abs(unit[idx]))
+    if unit[max_idx] < 0:
+        unit = neg_vec(unit)
+    return unit
+
+
+def cartesian_axis_label(vec: Iterable[float]) -> str:
+    unit = vec_normalize(vec)
+    labels = ["x", "y", "z"]
+    return labels[max(range(3), key=lambda idx: abs(unit[idx]))]
+
+
+def nearest_pair_image(
+    info: PoscarInfo,
+    pair: PairInfo,
+) -> tuple[tuple[int, int, int], tuple[float, float, float], tuple[float, float, float], float]:
+    disp_frac, shift = nearest_image_delta(info.frac_coords[pair.global_i], info.frac_coords[pair.global_j])
+    disp_cart = frac_to_cart(disp_frac, info.lattice)
+    return shift, disp_frac, disp_cart, vec_norm(disp_cart)
+
+
+def find_shared_ligands(
+    info: PoscarInfo,
+    pair: PairInfo,
+    ligand_global_indices: list[int],
+    cutoff: float,
+    pair_shift: tuple[int, int, int],
+) -> list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]]:
+    extent = translation_search_extent(info, cutoff)
+    i_frac = info.frac_coords[pair.global_i]
+    j_frac = vec_add(info.frac_coords[pair.global_j], pair_shift)
+    shared: list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]] = []
+    for lig_idx in ligand_global_indices:
+        for tx in range(-extent, extent + 1):
+            for ty in range(-extent, extent + 1):
+                for tz in range(-extent, extent + 1):
+                    lig_shift = (tx, ty, tz)
+                    lig_frac = vec_add(info.frac_coords[lig_idx], lig_shift)
+                    vi_frac = vec_sub(lig_frac, i_frac)
+                    vj_frac = vec_sub(lig_frac, j_frac)
+                    vi_cart = frac_to_cart(vi_frac, info.lattice)
+                    vj_cart = frac_to_cart(vj_frac, info.lattice)
+                    di = vec_norm(vi_cart)
+                    dj = vec_norm(vj_cart)
+                    if di <= cutoff and dj <= cutoff:
+                        shared.append((lig_idx, lig_shift, di, dj, lig_frac))
+    shared.sort(key=lambda item: (item[2] + item[3], max(item[2], item[3]), item[0], item[1]))
+    return shared
+
+
+def nearest_ligand_images(
+    info: PoscarInfo,
+    center_frac: tuple[float, float, float],
+    ligand_global_indices: list[int],
+    count: int = 6,
+) -> list[tuple[int, tuple[int, int, int], float, tuple[float, float, float], tuple[float, float, float]]]:
+    ranked: list[tuple[int, tuple[int, int, int], float, tuple[float, float, float], tuple[float, float, float]]] = []
+    for lig_idx in ligand_global_indices:
+        disp_frac, shift = nearest_image_delta(center_frac, info.frac_coords[lig_idx])
+        lig_frac = vec_add(info.frac_coords[lig_idx], shift)
+        disp_cart = frac_to_cart(disp_frac, info.lattice)
+        ranked.append((lig_idx, shift, vec_norm(disp_cart), lig_frac, disp_cart))
+    ranked.sort(key=lambda item: (item[2], item[0], item[1]))
+    return ranked[:count]
+
+
+def rank_ligand_references(
+    info: PoscarInfo,
+    i_frac: tuple[float, float, float],
+    j_frac: tuple[float, float, float],
+    ligand_global_indices: list[int],
+    search_cutoff: float,
+) -> list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]]:
+    extent = translation_search_extent(info, search_cutoff)
+    ranked: list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]] = []
+    for lig_idx in ligand_global_indices:
+        for tx in range(-extent, extent + 1):
+            for ty in range(-extent, extent + 1):
+                for tz in range(-extent, extent + 1):
+                    lig_shift = (tx, ty, tz)
+                    lig_frac = vec_add(info.frac_coords[lig_idx], lig_shift)
+                    vi_cart = frac_to_cart(vec_sub(lig_frac, i_frac), info.lattice)
+                    vj_cart = frac_to_cart(vec_sub(lig_frac, j_frac), info.lattice)
+                    di = vec_norm(vi_cart)
+                    dj = vec_norm(vj_cart)
+                    ranked.append((lig_idx, lig_shift, di, dj, lig_frac))
+    ranked.sort(key=lambda item: (item[2] + item[3], max(item[2], item[3]), item[0], item[1]))
+    return ranked
+
+
+def choose_kitaev_ligands(
+    info: PoscarInfo,
+    pair: PairInfo,
+    ligand_global_indices: list[int],
+    cutoff: float,
+    pair_shift: tuple[int, int, int],
+    pair_distance: float,
+) -> tuple[list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]], str]:
+    shared = find_shared_ligands(info, pair, ligand_global_indices, cutoff, pair_shift)
+    if len(shared) >= 2:
+        return shared[:2], "shared_within_cutoff"
+
+    i_frac = info.frac_coords[pair.global_i]
+    j_frac = vec_add(info.frac_coords[pair.global_j], pair_shift)
+    nearest_i = nearest_ligand_images(info, i_frac, ligand_global_indices, 6)
+    nearest_j = nearest_ligand_images(info, j_frac, ligand_global_indices, 6)
+    shared_nearest = sorted({item[0] for item in nearest_i} & {item[0] for item in nearest_j})
+    fallback_cutoff = max(cutoff, pair_distance + cutoff, 6.0)
+    if len(shared_nearest) >= 2:
+        ranked = rank_ligand_references(info, i_frac, j_frac, shared_nearest, fallback_cutoff)
+        if len(ranked) >= 2:
+            return ranked[:2], "nearest_six_shared"
+
+    ranked = rank_ligand_references(info, i_frac, j_frac, ligand_global_indices, fallback_cutoff)
+    if len(ranked) >= 2:
+        return ranked[:2], "distance_sum_fallback"
+    raise ValueError(f"Metal pair {pair.label} cannot find two ligand references")
+
+
+def angle_error_from_orthogonal(vec_a: tuple[float, float, float], vec_b: tuple[float, float, float]) -> float:
+    cos_theta = max(-1.0, min(1.0, vec_dot(vec_normalize(vec_a), vec_normalize(vec_b))))
+    return abs(math.degrees(math.acos(cos_theta)) - 90.0)
+
+
+def gram_schmidt_rows(rows: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    basis: list[tuple[float, float, float]] = []
+    for row_no, row in enumerate(rows, start=1):
+        vec = row
+        for prev in basis:
+            vec = vec_sub(vec, vec_scale(prev, vec_dot(vec, prev)))
+        basis.append(vec_normalize(vec, f"octahedral basis row {row_no}"))
+    return basis
+
+
+def find_octahedral_basis(
+    info: PoscarInfo,
+    center_global: int,
+    ligand_global_indices: list[int],
+    cutoff: float,
+) -> tuple[list[tuple[float, float, float]], list[tuple[int, tuple[int, int, int], float]], float] | None:
+    center_frac = info.frac_coords[center_global]
+    shell = nearest_ligand_images(info, center_frac, ligand_global_indices, 12)
+    local_shell = [item for item in shell if item[2] <= cutoff]
+    if len(local_shell) < 6:
+        local_shell = shell[:6]
+    if len(local_shell) < 3:
+        return None
+
+    best_combo = None
+    best_score = float("inf")
+    best_max_error = float("inf")
+    for combo in combinations(local_shell, 3):
+        vecs = [item[4] for item in combo]
+        errors = [angle_error_from_orthogonal(a, b) for a, b in combinations(vecs, 2)]
+        score = sum(errors)
+        max_error = max(errors)
+        if (score, max_error) < (best_score, best_max_error):
+            best_combo = combo
+            best_score = score
+            best_max_error = max_error
+
+    if best_combo is None:
+        return None
+    raw_basis = [item[4] for item in best_combo]
+    basis = gram_schmidt_rows(raw_basis)
+    ligand_summary = [(item[0], item[1], item[2]) for item in best_combo]
+    return basis, ligand_summary, best_max_error
+
+
+def construct_shared_ligand_reference_basis(
+    info: PoscarInfo,
+    pair: PairInfo,
+    chosen_ligands: list[tuple[int, tuple[int, int, int], float, float, tuple[float, float, float]]],
+    octahedral_basis: list[tuple[float, float, float]] | None,
+) -> list[tuple[float, float, float]]:
+    i_frac = info.frac_coords[pair.global_i]
+    ligand_vecs = [frac_to_cart(vec_sub(item[4], i_frac), info.lattice) for item in chosen_ligands[:2]]
+    x_axis = vec_normalize(ligand_vecs[0], "first shared-ligand vector")
+    second_axis = vec_normalize(ligand_vecs[1], "second shared-ligand vector")
+    y_axis = vec_sub(second_axis, vec_scale(x_axis, vec_dot(second_axis, x_axis)))
+    y_axis = vec_normalize(y_axis, "orthogonalized second shared-ligand vector")
+    z_axis = vec_normalize(vec_cross(x_axis, y_axis), "shared-ligand plane normal")
+
+    if octahedral_basis:
+        oct_axis = max(octahedral_basis, key=lambda axis: abs(vec_dot(axis, z_axis)))
+        if vec_dot(oct_axis, z_axis) < 0:
+            y_axis = neg_vec(y_axis)
+            z_axis = neg_vec(z_axis)
+    return [x_axis, y_axis, z_axis]
+
+
+def align_ideal_kitaev_basis(
+    reference_basis: list[tuple[float, float, float]],
+    allow_component_permutation: bool = True,
+) -> tuple[list[tuple[float, float, float]], tuple[float, float, float], str]:
+    reference = [vec_normalize(row, f"reference basis row {idx + 1}") for idx, row in enumerate(reference_basis)]
+    ideal = [vec_normalize(row, f"ideal Kitaev basis row {idx + 1}") for idx, row in enumerate(IDEAL_KITAEV_BASIS)]
+    component_perms = list(permutations(range(3))) if allow_component_permutation else [(0, 1, 2)]
+    component_sign_sets = list(product((-1.0, 1.0), repeat=3)) if allow_component_permutation else [(1.0, 1.0, 1.0)]
+
+    best_score = -float("inf")
+    best_basis: list[tuple[float, float, float]] | None = None
+    best_overlaps: tuple[float, float, float] | None = None
+    best_row_perm: tuple[int, int, int] | None = None
+    best_row_signs: tuple[float, float, float] | None = None
+    best_component_perm: tuple[int, int, int] | None = None
+    best_component_signs: tuple[float, float, float] | None = None
+
+    for row_perm in permutations(range(3)):
+        permuted = [ideal[idx] for idx in row_perm]
+        for row_signs in product((-1.0, 1.0), repeat=3):
+            row_signed = [vec_scale(permuted[idx], row_signs[idx]) for idx in range(3)]
+            for component_perm in component_perms:
+                for component_signs in component_sign_sets:
+                    candidate = [
+                        tuple(row[component_perm[col]] * component_signs[col] for col in range(3))
+                        for row in row_signed
+                    ]
+                    overlaps = tuple(vec_dot(candidate[idx], reference[idx]) for idx in range(3))
+                    score = sum(overlaps)
+                    if score > best_score:
+                        best_score = score
+                        best_basis = candidate
+                        best_overlaps = overlaps  # type: ignore[assignment]
+                        best_row_perm = row_perm  # type: ignore[assignment]
+                        best_row_signs = row_signs  # type: ignore[assignment]
+                        best_component_perm = component_perm  # type: ignore[assignment]
+                        best_component_signs = component_signs  # type: ignore[assignment]
+
+    if best_basis is None or best_overlaps is None:
+        raise ValueError("Could not align ideal Kitaev basis to reference basis")
+    match = (
+        f"ideal_rows_1based={','.join(str(idx + 1) for idx in best_row_perm or ())};"
+        f"row_signs={','.join(str(int(sign)) for sign in best_row_signs or ())};"
+        f"component_order_1based={','.join(str(idx + 1) for idx in best_component_perm or ())};"
+        f"component_signs={','.join(str(int(sign)) for sign in best_component_signs or ())}"
+    )
+    return best_basis, best_overlaps, match
+
+
+def choose_gamma_from_bond(
+    kitaev_axes: list[tuple[str, tuple[float, float, float]]],
+    bond_axis: tuple[float, float, float],
+) -> tuple[int, int, int, tuple[float, float, float]]:
+    axis_bond_dots = tuple(abs(vec_dot(axis, bond_axis)) for _, axis in kitaev_axes)
+    gamma_idx = min(range(3), key=lambda idx: axis_bond_dots[idx])
+    alpha_idx, beta_idx = [idx for idx in range(3) if idx != gamma_idx]
+    alpha_axis = kitaev_axes[alpha_idx][1]
+    beta_axis = kitaev_axes[beta_idx][1]
+    gamma_axis = kitaev_axes[gamma_idx][1]
+    if vec_dot(vec_cross(alpha_axis, beta_axis), gamma_axis) < 0:
+        alpha_idx, beta_idx = beta_idx, alpha_idx
+    return alpha_idx, beta_idx, gamma_idx, axis_bond_dots  # type: ignore[return-value]
+
+
+def fallback_perpendicular_axis(axis: tuple[float, float, float]) -> tuple[float, float, float]:
+    trial = min(AXIS.values(), key=lambda basis: abs(vec_dot(axis, basis)))
+    projected = vec_sub(trial, vec_scale(axis, vec_dot(trial, axis)))
+    return vec_normalize(projected, "fallback perpendicular axis")
+
+
+def detect_kitaev_frame(info: PoscarInfo, mag: list[int], pair: PairInfo, args: argparse.Namespace) -> KitaevFrame:
+    ligands = ligand_indices(info, mag, getattr(args, "ligand_elements", None))
+    pair_shift, pair_disp_frac, pair_disp_cart, pair_distance = nearest_pair_image(info, pair)
+    if pair_distance > getattr(args, "kitaev_pair_cutoff", 10.0):
+        raise ValueError(
+            f"{pair.label} nearest image distance is {pair_distance:.4f} A, larger than --kitaev-pair-cutoff"
+        )
+    chosen, ligand_method = choose_kitaev_ligands(
+        info,
+        pair,
+        ligands,
+        args.metal_ligand_cutoff,
+        pair_shift,
+        pair_distance,
+    )
+    octahedral = find_octahedral_basis(info, pair.global_i, ligands, args.metal_ligand_cutoff)
+    if octahedral:
+        octahedral_basis, octahedral_ligands, octahedral_angle_error = octahedral
+    else:
+        octahedral_basis = []
+        octahedral_ligands = []
+        octahedral_angle_error = None
+    reference_basis = construct_shared_ligand_reference_basis(
+        info,
+        pair,
+        chosen,
+        octahedral_basis if octahedral_basis else None,
+    )
+    kitaev_basis, axis_overlaps, axis_match = align_ideal_kitaev_basis(
+        reference_basis,
+        allow_component_permutation=not getattr(args, "kitaev_no_component_permutation", False),
+    )
+    kitaev_axes = list(zip(KITAEV_AXIS_LABELS, kitaev_basis))
+    bond_axis = vec_normalize(pair_disp_cart, "metal-metal bond")
+    alpha_idx, beta_idx, gamma_idx, axis_bond_dots = choose_gamma_from_bond(kitaev_axes, bond_axis)
+    alpha_label, local_x = kitaev_axes[alpha_idx]
+    beta_label, local_y = kitaev_axes[beta_idx]
+    gamma_label, gamma = kitaev_axes[gamma_idx]
+    shared_summary = [(idx, shift, di, dj) for idx, shift, di, dj, _ in chosen]
+    return KitaevFrame(
+        pair=pair,
+        gamma_axis=gamma,
+        local_x=local_x,
+        local_y=local_y,
+        bond_axis=bond_axis,
+        pair_shift=pair_shift,
+        shared_ligands=shared_summary,
+        gamma_label=gamma_label,
+        alpha_label=alpha_label,
+        beta_label=beta_label,
+        kitaev_axes=kitaev_axes,
+        reference_basis=reference_basis,
+        axis_overlaps=axis_overlaps,
+        axis_bond_dots=axis_bond_dots,
+        ligand_method=ligand_method,
+        axis_match=axis_match,
+        octahedral_ligands=octahedral_ligands,
+        octahedral_angle_error=octahedral_angle_error,
+    )
+
+
+def frame_rows(frame: KitaevFrame, info: PoscarInfo) -> list[str]:
+    ligands = ";".join(
+        f"{atom_label(info, idx)}@{format_shift(shift)}(d_i={di:.4f},d_j={dj:.4f})"
+        for idx, shift, di, dj in frame.shared_ligands
+    )
+    octahedral_ligands = ";".join(
+        f"{atom_label(info, idx)}@{format_shift(shift)}(d={dist:.4f})"
+        for idx, shift, dist in frame.octahedral_ligands
+    )
+    axis_rows = [
+        f"kitaev_{label}_axis_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
+        for label, axis in frame.kitaev_axes
+    ]
+    reference_rows = [
+        f"reference_basis_{idx}_cart\t{axis[0]:.10f}\t{axis[1]:.10f}\t{axis[2]:.10f}"
+        for idx, axis in enumerate(frame.reference_basis, start=1)
+    ]
+    return [
+        f"pair\t{frame.pair.label}",
+        f"pair_shift_j\t{format_shift(frame.pair_shift)}",
+        f"gamma_label\t{frame.gamma_label}",
+        f"alpha_label\t{frame.alpha_label}",
+        f"beta_label\t{frame.beta_label}",
+        f"gamma_axis_cart\t{frame.gamma_axis[0]:.10f}\t{frame.gamma_axis[1]:.10f}\t{frame.gamma_axis[2]:.10f}",
+        f"local_x_cart\t{frame.local_x[0]:.10f}\t{frame.local_x[1]:.10f}\t{frame.local_x[2]:.10f}",
+        f"local_y_cart\t{frame.local_y[0]:.10f}\t{frame.local_y[1]:.10f}\t{frame.local_y[2]:.10f}",
+        f"bond_axis_cart\t{frame.bond_axis[0]:.10f}\t{frame.bond_axis[1]:.10f}\t{frame.bond_axis[2]:.10f}",
+        f"axis_overlaps\t{frame.axis_overlaps[0]:.8f}\t{frame.axis_overlaps[1]:.8f}\t{frame.axis_overlaps[2]:.8f}",
+        f"axis_bond_abs_dots_xyz\t{frame.axis_bond_dots[0]:.8f}\t{frame.axis_bond_dots[1]:.8f}\t{frame.axis_bond_dots[2]:.8f}",
+        f"ligand_selection_method\t{frame.ligand_method}",
+        f"axis_match\t{frame.axis_match}",
+        f"octahedral_max_orthogonality_error_deg\t{frame.octahedral_angle_error:.6f}" if frame.octahedral_angle_error is not None else "octahedral_max_orthogonality_error_deg\tNA",
+        f"octahedral_ligands\t{octahedral_ligands}",
+        f"shared_ligands\t{ligands}",
+        *axis_rows,
+        *reference_rows,
+    ]
+
+
+def write_kitaev_frames(out_root: Path, frames: list[KitaevFrame], info: PoscarInfo) -> None:
+    lines = [
+        "pair\tgamma_label\talpha_label\tbeta_label\tpair_shift_j\t"
+        "gamma_x\tgamma_y\tgamma_z\talpha_x\talpha_y\talpha_z\tbeta_x\tbeta_y\tbeta_z\t"
+        "kitaev_x_x\tkitaev_x_y\tkitaev_x_z\tkitaev_y_x\tkitaev_y_y\tkitaev_y_z\tkitaev_z_x\tkitaev_z_y\tkitaev_z_z\t"
+        "overlap_x\toverlap_y\toverlap_z\tbond_dot_x\tbond_dot_y\tbond_dot_z\t"
+        "ligand_method\toctahedral_max_orthogonality_error_deg\tshared_ligands\toctahedral_ligands\taxis_match\n"
+    ]
+    for frame in frames:
+        ligands = ";".join(f"{atom_label(info, idx)}@{format_shift(shift)}" for idx, shift, _, _ in frame.shared_ligands)
+        octahedral_ligands = ";".join(
+            f"{atom_label(info, idx)}@{format_shift(shift)}" for idx, shift, _ in frame.octahedral_ligands
+        )
+        axis_map = {label: axis for label, axis in frame.kitaev_axes}
+        oct_err = f"{frame.octahedral_angle_error:.6f}" if frame.octahedral_angle_error is not None else "NA"
+        lines.append(
+            f"{frame.pair.label}\t{frame.gamma_label}\t{frame.alpha_label}\t{frame.beta_label}\t{format_shift(frame.pair_shift)}\t"
+            f"{frame.gamma_axis[0]:.10f}\t{frame.gamma_axis[1]:.10f}\t{frame.gamma_axis[2]:.10f}\t"
+            f"{frame.local_x[0]:.10f}\t{frame.local_x[1]:.10f}\t{frame.local_x[2]:.10f}\t"
+            f"{frame.local_y[0]:.10f}\t{frame.local_y[1]:.10f}\t{frame.local_y[2]:.10f}\t"
+            f"{axis_map['x'][0]:.10f}\t{axis_map['x'][1]:.10f}\t{axis_map['x'][2]:.10f}\t"
+            f"{axis_map['y'][0]:.10f}\t{axis_map['y'][1]:.10f}\t{axis_map['y'][2]:.10f}\t"
+            f"{axis_map['z'][0]:.10f}\t{axis_map['z'][1]:.10f}\t{axis_map['z'][2]:.10f}\t"
+            f"{frame.axis_overlaps[0]:.8f}\t{frame.axis_overlaps[1]:.8f}\t{frame.axis_overlaps[2]:.8f}\t"
+            f"{frame.axis_bond_dots[0]:.8f}\t{frame.axis_bond_dots[1]:.8f}\t{frame.axis_bond_dots[2]:.8f}\t"
+            f"{frame.ligand_method}\t{oct_err}\t{ligands}\t{octahedral_ligands}\t{frame.axis_match}\n"
+        )
+    (out_root / "kitaev_frames.tsv").write_text("".join(lines))
+
+
+def mat_vec(matrix: list[list[float]], vec: tuple[float, float, float]) -> tuple[float, float, float]:
+    return tuple(sum(matrix[row][col] * vec[col] for col in range(3)) for row in range(3))  # type: ignore[return-value]
+
+
+def rotate_tensor_to_basis(
+    matrix: list[list[float]],
+    basis: list[tuple[float, float, float]],
+) -> list[list[float]]:
+    return [[vec_dot(basis[row], mat_vec(matrix, basis[col])) for col in range(3)] for row in range(3)]
+
+
+def rotate_tensor_to_frame(
+    matrix: list[list[float]],
+    frame: KitaevFrame,
+) -> list[list[float]]:
+    return rotate_tensor_to_basis(matrix, [frame.local_x, frame.local_y, frame.gamma_axis])
+
+
+def parse_jani_summary(root: Path, pair_label: str, stage_name: str | None) -> list[list[float]]:
+    summary = root / "final_summary.txt"
+    if not summary.exists():
+        raise FileNotFoundError(f"Jani final_summary.txt not found: {summary}")
+    current_stage: str | None = None
+    values: dict[str, float] = {}
+    for raw in summary.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_stage = line.strip("[]")
+            continue
+        if line.startswith("#"):
+            continue
+        if stage_name and current_stage != stage_name:
+            continue
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+        label, quantity, value_text = parts[0], parts[1], parts[-1]
+        for comp in JANI_COMPONENTS:
+            if quantity == f"{comp}_meV" and (label == comp or label == f"{pair_label}_{comp}"):
+                values[comp] = float(value_text)
+    missing = [comp for comp in JANI_COMPONENTS if comp not in values]
+    if missing:
+        raise ValueError(f"Missing Jani components in {summary}: {', '.join(missing)}")
+    return [
+        [values["Jxx"], values["Jxy"], values["Jxz"]],
+        [values["Jyx"], values["Jyy"], values["Jyz"]],
+        [values["Jzx"], values["Jzy"], values["Jzz"]],
+    ]
+
+
+def matrix_lines(title: str, matrix: list[list[float]]) -> list[str]:
+    lines = [title]
+    for row in matrix:
+        lines.append("  " + " ".join(f"{value: .8f}" for value in row))
+    return lines
+
+
+def kitaev_report(args: argparse.Namespace) -> None:
+    info = read_poscar(Path(args.poscar))
+    mag = magnetic_indices(info, args.magnetic_elements)
+    if not args.pair:
+        raise ValueError("--pair is required for kitaev-report")
+    pairs = parse_pairs(args.pair, args.index_mode, mag, info.natoms)
+    if len(pairs) != 1:
+        raise ValueError("kitaev-report expects exactly one pair")
+    frame = detect_kitaev_frame(info, mag, pairs[0], args)
+    lines = ["Kitaev local-frame report", *frame_rows(frame, info)]
+    if args.jani_root:
+        global_matrix = parse_jani_summary(Path(args.jani_root), frame.pair.label, args.stage)
+        kitaev_matrix = rotate_tensor_to_basis(global_matrix, [axis for _, axis in frame.kitaev_axes])
+        local_matrix = rotate_tensor_to_frame(global_matrix, frame)
+        jiso_trace = sum(local_matrix[i][i] for i in range(3)) / 3.0
+        k_minus_trace = local_matrix[2][2] - jiso_trace
+        k_minus_ab = local_matrix[2][2] - 0.5 * (local_matrix[0][0] + local_matrix[1][1])
+        lines.extend(matrix_lines("global_J_meV", global_matrix))
+        lines.extend(matrix_lines("kitaev_J_meV rows=(x,y,z)", kitaev_matrix))
+        lines.extend(matrix_lines("local_J_meV rows=(alpha,beta,gamma)", local_matrix))
+        lines.append(f"Jiso_trace_meV\t{jiso_trace:.8f}")
+        lines.append(f"J_gamma_gamma_meV\t{local_matrix[2][2]:.8f}")
+        lines.append(f"K_gamma_minus_trace_iso_meV\t{k_minus_trace:.8f}")
+        lines.append(f"K_gamma_minus_alpha_beta_avg_meV\t{k_minus_ab:.8f}")
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text)
+        print(f"[OK] Wrote {out.resolve()}")
+
+
+def scale_vec(vec: Iterable[float], moment: float) -> tuple[float, float, float]:
+    return tuple(float(x) * moment for x in vec)  # type: ignore[return-value]
+
+
+def neg_vec(vec: Iterable[float]) -> tuple[float, float, float]:
+    return tuple(-float(x) for x in vec)  # type: ignore[return-value]
+
+
+def axis_vec(axis: str, moment: float) -> tuple[float, float, float]:
+    return scale_vec(AXIS[axis], moment)
+
+
+def base_vectors(natoms: int, mag: list[int], moment: float, background_axis: str) -> list[tuple[float, float, float]]:
+    zero = (0.0, 0.0, 0.0)
+    background = axis_vec(background_axis, moment)
+    vecs = [zero for _ in range(natoms)]
+    for idx in mag:
+        vecs[idx] = background
+    return vecs
+
+
+def flatten_magmom(vecs: list[tuple[float, float, float]]) -> str:
+    return " ".join(f"{value:.8f}" for vec in vecs for value in vec)
+
+
+def jani_state_units(component: str) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    if not re.fullmatch(r"J[xyz][xyz]", component):
+        raise ValueError(f"Bad Jani component: {component}")
+    a = AXIS[component[1]]
+    b = AXIS[component[2]]
+    return [(a, b), (a, neg_vec(b)), (neg_vec(a), b), (neg_vec(a), neg_vec(b))]
+
+
+def sia_state_units(component: str) -> tuple[str, list[tuple[float, float, float]]]:
+    inv = 1.0 / math.sqrt(2.0)
+    if component == "Axy":
+        return "z", [(inv, inv, 0.0), (inv, -inv, 0.0), (-inv, inv, 0.0), (-inv, -inv, 0.0)]
+    if component == "Axz":
+        return "y", [(inv, 0.0, inv), (inv, 0.0, -inv), (-inv, 0.0, inv), (-inv, 0.0, -inv)]
+    if component == "Ayz":
+        return "x", [(0.0, inv, inv), (0.0, inv, -inv), (0.0, -inv, inv), (0.0, -inv, -inv)]
+    if component == "Ayy_minus_Axx":
+        return "z", [AXIS["y"], AXIS["x"], neg_vec(AXIS["x"]), neg_vec(AXIS["y"])]
+    if component == "Azz_minus_Axx":
+        return "y", [AXIS["z"], AXIS["x"], neg_vec(AXIS["x"]), neg_vec(AXIS["z"])]
+    raise ValueError(f"Bad SIA component: {component}")
+
+
+def biqua_state_units() -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    inv = 1.0 / math.sqrt(2.0)
+    return [
+        (AXIS["x"], AXIS["x"]),
+        (AXIS["x"], neg_vec(AXIS["x"])),
+        (AXIS["x"], (inv, inv, 0.0)),
+        (AXIS["x"], (-inv, -inv, 0.0)),
+    ]
+
+
+def read_incar(path: Path) -> list[str]:
+    if path.exists():
+        return path.read_text().splitlines(keepends=True)
+    return []
+
+
+def set_incar_tags(path: Path, tags: dict[str, str]) -> None:
+    lines = read_incar(path)
+    seen: set[str] = set()
+    out: list[str] = []
+    patterns = {tag.upper(): re.compile(rf"^\s*{re.escape(tag)}\s*=", re.I) for tag in tags}
+    for line in lines:
+        matched = None
+        for tag, pattern in patterns.items():
+            if pattern.match(line):
+                matched = tag
+                break
+        if matched is None:
+            out.append(line)
+            continue
+        if matched in seen:
+            continue
+        out.append(f"{matched} = {tags[matched]}\n")
+        seen.add(matched)
+    for tag, value in tags.items():
+        tag = tag.upper()
+        if tag not in seen:
+            out.append(f"{tag} = {value}\n")
+    path.write_text("".join(out))
+
+
+def copy_required_inputs(src: Path, dst: Path, poscar: Path | None = None) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in REQUIRED_INPUTS:
+        source = poscar if name == "POSCAR" and poscar is not None else src / name
+        if not source.exists():
+            raise FileNotFoundError(f"Required input missing: {source}")
+        shutil.copy2(source, dst / name)
+
+
+def common_incar_tags(magmom: str, args: argparse.Namespace) -> dict[str, str]:
+    tags = {
+        "MAGMOM": magmom,
+        "M_CONSTR": magmom,
+        "LNONCOLLINEAR": ".TRUE.",
+        "I_CONSTRAINED_M": "1",
+    }
+    if args.saxis:
+        tags["SAXIS"] = " ".join(args.saxis)
+    return tags
+
+
+def stage_tags(stage: str, args: argparse.Namespace) -> dict[str, str]:
+    if args.no_stage_tag_edits:
+        return {}
+    if stage == "pbe":
+        return {
+            "ISTART": "0",
+            "ICHARG": "2",
+            "LWAVE": ".TRUE.",
+            "LCHARG": ".TRUE.",
+        }
+    if stage == "hse":
+        return {
+            "ISTART": "1",
+            "ICHARG": "0",
+            "LWAVE": ".TRUE.",
+            "LCHARG": ".TRUE.",
+            "LHFCALC": ".TRUE.",
+            "GGA": "PE",
+            "HFSCREEN": "0.2",
+            "AEXX": "0.25",
+            "ALGO": "All",
+            "LDAU": ".FALSE.",
+        }
+    return {}
+
+
+def write_state(
+    out_root: Path,
+    relpath: str,
+    magmom: str,
+    system_label: str,
+    args: argparse.Namespace,
+) -> None:
+    poscar_override = Path(args.poscar).resolve()
+    if args.workflow == "pbe-hse":
+        pbe_src = Path(args.pbe_input_dir or args.input_dir).resolve()
+        hse_src = Path(args.hse_input_dir or args.input_dir).resolve()
+        pbe_dst = out_root / "pbe" / relpath
+        hse_dst = out_root / relpath
+        copy_required_inputs(pbe_src, pbe_dst, poscar_override)
+        copy_required_inputs(hse_src, hse_dst, poscar_override)
+        pbe_tags = common_incar_tags(magmom, args) | stage_tags("pbe", args)
+        hse_tags = common_incar_tags(magmom, args) | stage_tags("hse", args)
+        pbe_tags["SYSTEM"] = f"{system_label} PBE+U pre"
+        hse_tags["SYSTEM"] = f"{system_label} HSE06 no-U"
+        set_incar_tags(pbe_dst / "INCAR", pbe_tags)
+        set_incar_tags(hse_dst / "INCAR", hse_tags)
+        return
+    src = Path(args.input_dir).resolve()
+    dst = out_root / relpath
+    copy_required_inputs(src, dst, poscar_override)
+    tags = common_incar_tags(magmom, args)
+    tags["SYSTEM"] = system_label
+    set_incar_tags(dst / "INCAR", tags)
+
+
+def add_job(jobs: list[dict[str, str]], relpath: str, name: str, description: str) -> None:
+    jobs.append({"relpath": relpath, "job_name": name, "description": description})
+
+
+def generate_jani(
+    info: PoscarInfo,
+    mag: list[int],
+    pairs: list[PairInfo],
+    out_root: Path,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    jobs: list[dict[str, str]] = []
+    formulas: list[dict[str, object]] = []
+    nest_pairs = len(pairs) > 1
+    background_axis = args.background_axis or "z"
+    for pair in pairs:
+        prefix = f"{pair.label}/" if nest_pairs else ""
+        for comp in JANI_COMPONENTS:
+            states = []
+            for state_no, (ui, uj) in enumerate(jani_state_units(comp), start=1):
+                vecs = base_vectors(info.natoms, mag, args.moment, background_axis)
+                vecs[pair.global_i] = scale_vec(ui, args.moment)
+                vecs[pair.global_j] = scale_vec(uj, args.moment)
+                rel = f"{prefix}{comp}/{state_no}"
+                write_state(out_root, rel, flatten_magmom(vecs), f"{pair.label}_{comp}_{state_no}", args)
+                add_job(jobs, rel, f"{pair.label}_{comp}_{state_no}", f"{pair.label} {comp} state {state_no}")
+                states.append(rel)
+            formulas.append(
+                {
+                    "label": f"{pair.label}_{comp}" if nest_pairs else comp,
+                    "kind": "four_state",
+                    "quantity": f"{comp}_meV",
+                    "states": states,
+                    "state_labels": ["E1", "E2", "E3", "E4"],
+                    "formula": "(E1 - E2 - E3 + E4) * 1000 / 4",
+                }
+            )
+    return jobs, formulas
+
+
+def generate_jiso(
+    info: PoscarInfo,
+    mag: list[int],
+    pairs: list[PairInfo],
+    out_root: Path,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    jobs: list[dict[str, str]] = []
+    formulas: list[dict[str, object]] = []
+    background_axis = args.background_axis or "x"
+    spin_units = {
+        "upup": (AXIS[args.pair_axis], AXIS[args.pair_axis]),
+        "updn": (AXIS[args.pair_axis], neg_vec(AXIS[args.pair_axis])),
+        "dnup": (neg_vec(AXIS[args.pair_axis]), AXIS[args.pair_axis]),
+        "dndn": (neg_vec(AXIS[args.pair_axis]), neg_vec(AXIS[args.pair_axis])),
+    }
+    for pair in pairs:
+        states = []
+        for spin in JISO_SPINS:
+            ui, uj = spin_units[spin]
+            vecs = base_vectors(info.natoms, mag, args.moment, background_axis)
+            vecs[pair.global_i] = scale_vec(ui, args.moment)
+            vecs[pair.global_j] = scale_vec(uj, args.moment)
+            rel = f"{pair.label}/{spin}"
+            write_state(out_root, rel, flatten_magmom(vecs), f"{pair.label}_{spin}", args)
+            add_job(jobs, rel, f"{pair.label}_{spin}", f"{pair.label} {spin}")
+            states.append(rel)
+        formulas.append(
+            {
+                "label": pair.label,
+                "kind": "four_state",
+                "quantity": "Jiso_meV",
+                "states": states,
+                "state_labels": JISO_SPINS,
+                "formula": "(E_upup - E_updn - E_dnup + E_dndn) * 1000 / 4",
+            }
+        )
+    return jobs, formulas
+
+
+def generate_kitaev(
+    info: PoscarInfo,
+    mag: list[int],
+    pairs: list[PairInfo],
+    out_root: Path,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    jobs: list[dict[str, str]] = []
+    formulas: list[dict[str, object]] = []
+    frames: list[KitaevFrame] = []
+    background_axis = args.background_axis or "z"
+    spin_names = ["pp", "pm", "mp", "mm"]
+    nest_pairs = len(pairs) > 1
+    for pair in pairs:
+        frame = detect_kitaev_frame(info, mag, pair, args)
+        frames.append(frame)
+        gamma = frame.gamma_axis
+        spin_units = {
+            "pp": (gamma, gamma),
+            "pm": (gamma, neg_vec(gamma)),
+            "mp": (neg_vec(gamma), gamma),
+            "mm": (neg_vec(gamma), neg_vec(gamma)),
+        }
+        prefix = f"{pair.label}/" if nest_pairs else ""
+        states: list[str] = []
+        for spin in spin_names:
+            ui, uj = spin_units[spin]
+            vecs = base_vectors(info.natoms, mag, args.moment, background_axis)
+            vecs[pair.global_i] = scale_vec(ui, args.moment)
+            vecs[pair.global_j] = scale_vec(uj, args.moment)
+            rel = f"{prefix}Kitaev_{frame.gamma_label}/{spin}"
+            write_state(out_root, rel, flatten_magmom(vecs), f"{pair.label}_Kitaev_{frame.gamma_label}_{spin}", args)
+            add_job(jobs, rel, f"{pair.label}_K_{frame.gamma_label}_{spin}", f"{pair.label} Kitaev {frame.gamma_label} {spin}")
+            states.append(rel)
+        formulas.append(
+            {
+                "label": f"{pair.label}_Kitaev_{frame.gamma_label}" if nest_pairs else f"Kitaev_{frame.gamma_label}",
+                "kind": "four_state",
+                "quantity": "J_gamma_gamma_meV",
+                "states": states,
+                "state_labels": spin_names,
+                "formula": "(E_pp - E_pm - E_mp + E_mm) * 1000 / 4",
+                "note": "Projection along the octahedral gamma axis. Rotate full Jani with kitaev-report for K minus isotropic part.",
+            }
+        )
+    write_kitaev_frames(out_root, frames, info)
+    return jobs, formulas
+
+
+def generate_sia(
+    info: PoscarInfo,
+    mag: list[int],
+    out_root: Path,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    if args.atom is None:
+        raise ValueError("--atom is required for --kind sia")
+    target_global, target_mag = one_based_to_global(args.atom, args.index_mode, mag, info.natoms)
+    label = f"{info.atom_symbols[target_global]}{args.atom}"
+    jobs: list[dict[str, str]] = []
+    formulas: list[dict[str, object]] = []
+    for comp in SIA_COMPONENTS:
+        bg_axis, units = sia_state_units(comp)
+        states = []
+        for state_no, unit in enumerate(units, start=1):
+            state_label = f"E{state_no}"
+            vecs = base_vectors(info.natoms, mag, args.moment, bg_axis)
+            vecs[target_global] = scale_vec(unit, args.moment)
+            rel = f"{comp}/{state_label}"
+            write_state(out_root, rel, flatten_magmom(vecs), f"SIA_{label}_{comp}_{state_label}", args)
+            add_job(jobs, rel, f"SIA_{label}_{comp}_{state_label}", f"SIA {label} {comp} {state_label}")
+            states.append(rel)
+        formulas.append(
+            {
+                "label": comp,
+                "kind": "four_state",
+                "quantity": f"{comp}_meV",
+                "states": states,
+                "state_labels": ["E1", "E2", "E3", "E4"],
+                "formula": "(E1 - E2 - E3 + E4) * 1000 / 4",
+            }
+        )
+    (out_root / "sia_target.tsv").write_text(
+        "input_index\tindex_mode\tglobal_index\tmagnetic_index\telement\n"
+        f"{args.atom}\t{args.index_mode}\t{target_global + 1}\t{target_mag}\t{info.atom_symbols[target_global]}\n"
+    )
+    return jobs, formulas
+
+
+def generate_biqua(
+    info: PoscarInfo,
+    mag: list[int],
+    pairs: list[PairInfo],
+    out_root: Path,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, str]], list[dict[str, object]]]:
+    if len(pairs) != 1:
+        raise ValueError("biquadratic generation expects exactly one pair")
+    pair = pairs[0]
+    jobs: list[dict[str, str]] = []
+    states = []
+    background_axis = args.background_axis or "z"
+    for state_no, (ui, uj) in enumerate(biqua_state_units(), start=1):
+        vecs = base_vectors(info.natoms, mag, args.moment, background_axis)
+        vecs[pair.global_i] = scale_vec(ui, args.moment)
+        vecs[pair.global_j] = scale_vec(uj, args.moment)
+        rel = f"Biquadratic/{state_no}"
+        write_state(out_root, rel, flatten_magmom(vecs), f"{pair.label}_Biquadratic_{state_no}", args)
+        add_job(jobs, rel, f"{pair.label}_Bq_{state_no}", f"{pair.label} biquadratic state {state_no}")
+        states.append(rel)
+    (out_root / "state_map.tsv").write_text(
+        "state\tS1_i\tS2_j\told_script_label\n"
+        "1\t(1,0,0)\t(1,0,0)\tE1\n"
+        "2\t(1,0,0)\t(-1,0,0)\tE2\n"
+        "3\t(1,0,0)\t(1/sqrt2,1/sqrt2,0)\tE3\n"
+        "4\t(1,0,0)\t(-1/sqrt2,-1/sqrt2,0)\tE4\n"
+    )
+    return jobs, [
+        {
+            "label": pair.label,
+            "kind": "biquadratic",
+            "quantity": "Biquadratic_B_meV",
+            "states": states,
+            "state_labels": ["E1", "E2", "E3", "E4"],
+            "formula": "B = (E1 + E2 - E3 - E4) * 1000; J = (E1 - E2) * 1000 / 2",
+        }
+    ]
+
+
+def write_jobs_tsv(out_root: Path, jobs: list[dict[str, str]]) -> None:
+    lines = ["relpath\tjob_name\tdescription\n"]
+    for job in jobs:
+        lines.append(f"{job['relpath']}\t{job['job_name']}\t{job['description']}\n")
+    (out_root / "state_jobs.tsv").write_text("".join(lines))
+
+
+def write_pair_indexing(out_root: Path, pairs: list[PairInfo]) -> None:
+    if not pairs:
+        return
+    lines = ["pair\tinput_i\tinput_j\tglobal_i\tglobal_j\tmagnetic_i\tmagnetic_j\n"]
+    for pair in pairs:
+        lines.append(
+            f"{pair.label}\t{pair.label_i}\t{pair.label_j}\t"
+            f"{pair.global_i + 1}\t{pair.global_j + 1}\t{pair.magnetic_i}\t{pair.magnetic_j}\n"
+        )
+    (out_root / "pair_indexing.tsv").write_text("".join(lines))
+
+
+def write_run_scripts(out_root: Path, workflow: str) -> None:
+    run_state = r"""#!/usr/bin/env bash
+#SBATCH --partition=queue1-1,queue3-1,queue3-2,queue3-3
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=64
+#SBATCH --cpus-per-task=1
+#SBATCH --time=10-00:00:00
+#SBATCH --output=%x_%j.log
+#SBATCH --error=%x_%j.err
+
+set -euo pipefail
+REL=${1:?relative state path required}
+ROOT=${SLURM_SUBMIT_DIR:-$(pwd)}
+SAFE_REL=${REL//\//_}
+VASP_EXE=${VASP_EXE:-vasp_ncl}
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$ROOT/stage_status_${SAFE_REL}.log"; }
+
+converged_outcar() {
+  local outcar="$1"
+  [ -s "$outcar" ] || return 1
+  grep -q 'General timing and accounting' "$outcar" || return 1
+  if grep -q 'EDIFF was not reached' "$outcar"; then
+    return 1
+  fi
+  return 0
+}
+
+save_outputs() {
+  local suffix="$1"
+  [ -f output ] && cp -f output "output.$suffix"
+  [ -f OUTCAR ] && cp -f OUTCAR "OUTCAR.$suffix"
+  [ -f OSZICAR ] && cp -f OSZICAR "OSZICAR.$suffix"
+  [ -f CONTCAR ] && cp -f CONTCAR "CONTCAR.$suffix"
+  [ -f vasprun.xml ] && cp -f vasprun.xml "vasprun.xml.$suffix"
+  [ -f REPORT ] && cp -f REPORT "REPORT.$suffix"
+}
+
+clean_runtime_outputs() {
+  rm -f OUTCAR OSZICAR vasprun.xml CONTCAR XDATCAR DOSCAR EIGENVAL IBZKPT PCDAT PROCAR REPORT output
+}
+
+if [ -f /software/compiler/intel/oneapi/setvars.sh ]; then
+  set +u
+  source /software/compiler/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+  set -u
+fi
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export I_MPI_HYDRA_BOOTSTRAP=${I_MPI_HYDRA_BOOTSTRAP:-slurm}
+if [ -e /opt/gridview/slurm/lib/libpmi.so ]; then
+  export I_MPI_PMI_LIBRARY=${I_MPI_PMI_LIBRARY:-/opt/gridview/slurm/lib/libpmi.so}
+fi
+
+run_one() {
+  local dir="$1"
+  local suffix="$2"
+  cd "$dir"
+  if converged_outcar "OUTCAR.$suffix"; then
+    log "$REL $suffix already converged, skip"
+    return
+  fi
+  rm -f "output.$suffix" "OUTCAR.$suffix" "OSZICAR.$suffix" "CONTCAR.$suffix" "vasprun.xml.$suffix" "REPORT.$suffix"
+  clean_runtime_outputs
+  log "Run $suffix in $dir"
+  srun "$VASP_EXE" > output 2>&1
+  save_outputs "$suffix"
+  if ! converged_outcar "OUTCAR.$suffix"; then
+    log "ERROR $suffix did not converge normally"
+    exit 10
+  fi
+}
+
+PBE_DIR="$ROOT/pbe/$REL"
+FINAL_DIR="$ROOT/$REL"
+if [ -d "$PBE_DIR" ]; then
+  run_one "$PBE_DIR" pbe_pre
+  if [ ! -s "$PBE_DIR/WAVECAR" ] || [ ! -s "$PBE_DIR/CHGCAR" ]; then
+    log "ERROR PBE pre finished but WAVECAR/CHGCAR missing"
+    exit 11
+  fi
+  cd "$FINAL_DIR"
+  if converged_outcar OUTCAR.hse_no_u; then
+    log "$REL hse_no_u already converged, skip"
+  else
+    rm -f output.hse_no_u OUTCAR.hse_no_u OSZICAR.hse_no_u CONTCAR.hse_no_u vasprun.xml.hse_no_u REPORT.hse_no_u
+    clean_runtime_outputs
+    cp -f "$PBE_DIR/WAVECAR" WAVECAR
+    cp -f "$PBE_DIR/CHGCAR" CHGCAR
+    [ -s "$PBE_DIR/CHG" ] && cp -f "$PBE_DIR/CHG" CHG || true
+    log "Run hse_no_u in $FINAL_DIR"
+    srun "$VASP_EXE" > output 2>&1
+    save_outputs hse_no_u
+    if ! converged_outcar OUTCAR.hse_no_u; then
+      log "ERROR hse_no_u did not converge normally"
+      exit 20
+    fi
+  fi
+else
+  run_one "$FINAL_DIR" single
+fi
+log "DONE $REL"
+"""
+    submit_all = r"""#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${SLURM_SUBMIT_DIR:-$(pwd)}
+cd "$ROOT"
+: > submitted_jobs.tsv
+tail -n +2 state_jobs.tsv | while IFS=$'\t' read -r relpath job_name description; do
+  [ -n "${relpath:-}" ] || continue
+  output=$(sbatch --job-name="$job_name" ./run_state.sh "$relpath")
+  jobid=$(printf '%s\n' "$output" | awk '{print $NF}')
+  printf '%s\t%s\t%s\n' "$relpath" "$job_name" "$jobid" | tee -a submitted_jobs.tsv
+done
+"""
+    postprocess_sh = r"""#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${SLURM_SUBMIT_DIR:-$(pwd)}
+cd "$ROOT"
+python3 ./postprocess.py
+"""
+    (out_root / "run_state.sh").write_text(run_state)
+    (out_root / "submit_all.sh").write_text(submit_all)
+    (out_root / "postprocess.sh").write_text(postprocess_sh)
+    for name in ["run_state.sh", "submit_all.sh", "postprocess.sh"]:
+        try:
+            (out_root / name).chmod(0o755)
+        except OSError:
+            pass
+
+
+POSTPROCESS_PY = r'''#!/usr/bin/env python3
+from __future__ import annotations
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+ENERGY_RE = re.compile(r"E0=\s*([-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?)")
+TOTEN_RE = re.compile(r"free\s+energy\s+TOTEN\s+=\s+([-+]?\d+(?:\.\d+)?(?:[Ee][-+]?\d+)?)")
+
+def extract_energy(path: Path, suffix: str) -> float:
+    candidates = [
+        path / f"output.{suffix}",
+        path / f"OSZICAR.{suffix}",
+        path / f"OUTCAR.{suffix}",
+        path / "output",
+        path / "OSZICAR",
+        path / "OUTCAR",
+    ]
+    for cand in candidates:
+        if not cand.exists() or cand.stat().st_size == 0:
+            continue
+        text = cand.read_text(errors="ignore")
+        matches = ENERGY_RE.findall(text)
+        if matches:
+            return float(matches[-1])
+        matches = TOTEN_RE.findall(text)
+        if matches:
+            return float(matches[-1])
+    raise FileNotFoundError(f"No energy found in {path} for suffix {suffix}")
+
+def calc_four_state(es):
+    return (es[0] - es[1] - es[2] + es[3]) * 1000.0 / 4.0
+
+def collect_stage(root: Path, metadata: dict, stage: dict) -> str:
+    base = root / stage["base"] if stage["base"] else root
+    suffix = stage["suffix"]
+    lines = [f"# stage {stage['name']}", "# label quantity E1 E2 E3 E4 value_meV"]
+    for formula in metadata["formulas"]:
+        energies = [extract_energy(base / rel, suffix) for rel in formula["states"]]
+        if formula["kind"] == "biquadratic":
+            j = (energies[0] - energies[1]) * 1000.0 / 2.0
+            b = (energies[0] + energies[1] - energies[2] - energies[3]) * 1000.0
+            lines.append(
+                f"{formula['label']} J_meV {energies[0]:.12f} {energies[1]:.12f} "
+                f"{energies[2]:.12f} {energies[3]:.12f} {j:.8f}"
+            )
+            lines.append(
+                f"{formula['label']} Biquadratic_B_meV {energies[0]:.12f} {energies[1]:.12f} "
+                f"{energies[2]:.12f} {energies[3]:.12f} {b:.8f}"
+            )
+        else:
+            value = calc_four_state(energies)
+            lines.append(
+                f"{formula['label']} {formula['quantity']} {energies[0]:.12f} {energies[1]:.12f} "
+                f"{energies[2]:.12f} {energies[3]:.12f} {value:.8f}"
+            )
+    return "\n".join(lines) + "\n"
+
+def main():
+    root = Path.cwd()
+    metadata = json.loads((root / "metadata.json").read_text())
+    results = root / "results"
+    results.mkdir(exist_ok=True)
+    summary = []
+    for stage in metadata["stages"]:
+        text = collect_stage(root, metadata, stage)
+        out = results / f"{stage['name']}_{metadata['kind']}_energy.dat"
+        out.write_text(text)
+        summary.append(f"[{stage['name']}]\n{text}")
+    (root / "final_summary.txt").write_text("\n".join(summary))
+    print(f"Wrote {root / 'final_summary.txt'}")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def write_postprocess_py(out_root: Path) -> None:
+    path = out_root / "postprocess.py"
+    path.write_text(POSTPROCESS_PY)
+    try:
+        path.chmod(0o755)
+    except OSError:
+        pass
+
+
+def effective_background_axis(kind: str, args: argparse.Namespace) -> str:
+    if kind == "sia":
+        return "component-specific"
+    if args.background_axis:
+        return args.background_axis
+    if kind == "jiso":
+        return "x"
+    return "z"
+
+
+def write_metadata(
+    out_root: Path,
+    kind: str,
+    workflow: str,
+    info: PoscarInfo,
+    mag: list[int],
+    args: argparse.Namespace,
+    formulas: list[dict[str, object]],
+) -> None:
+    stages = STAGE_PBE_HSE if workflow == "pbe-hse" else STAGE_SINGLE
+    metadata = {
+        "kind": kind,
+        "workflow": workflow,
+        "poscar": str(Path(args.poscar).resolve()),
+        "natoms": info.natoms,
+        "elements": info.elements,
+        "counts": info.counts,
+        "magnetic_elements": args.magnetic_elements,
+        "ligand_elements": getattr(args, "ligand_elements", None),
+        "magnetic_indices_global_1based": [idx + 1 for idx in mag],
+        "moment": args.moment,
+        "background_axis_effective": effective_background_axis(kind, args),
+        "pair_axis": args.pair_axis,
+        "index_mode": args.index_mode,
+        "stages": stages,
+        "formulas": formulas,
+    }
+    (out_root / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+
+def write_readme(out_root: Path, kind: str, workflow: str, args: argparse.Namespace) -> None:
+    text = f"""Four-state VASP calculation
+kind = {kind}
+workflow = {workflow}
+moment = {args.moment}
+background_axis = {effective_background_axis(kind, args)}
+pair_axis = {args.pair_axis}
+index_mode = {args.index_mode}
+
+Files:
+- state_jobs.tsv: relative state directories and suggested Slurm job names.
+- run_state.sh: runs one state. Use: sbatch run_state.sh <relpath>
+- submit_all.sh: submits every row in state_jobs.tsv.
+- postprocess.sh/postprocess.py: collect energies after jobs finish.
+- metadata.json: machine-readable formulas and directory map.
+
+Energy formulas:
+- Jani/Jiso/SIA: value_meV = (E1 - E2 - E3 + E4) * 1000 / 4.
+- Biquadratic: B_meV = (E1 + E2 - E3 - E4) * 1000; J_meV = (E1 - E2) * 1000 / 2.
+
+Indexing:
+- input pair/atom labels use the selected index_mode.
+- pair_indexing.tsv records global POSCAR indices and magnetic-ion ordinals.
+"""
+    (out_root / "README.txt").write_text(text)
+
+
+def prepare(args: argparse.Namespace) -> None:
+    info = read_poscar(Path(args.poscar).resolve())
+    mag = magnetic_indices(info, args.magnetic_elements)
+    if not mag:
+        raise ValueError("No magnetic atoms selected")
+    out_root = Path(args.out).resolve()
+    if out_root.exists() and any(out_root.iterdir()) and not args.force:
+        raise FileExistsError(f"Output directory is not empty: {out_root}. Use --force to write into it.")
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    pairs: list[PairInfo] = []
+    jobs: list[dict[str, str]]
+    formulas: list[dict[str, object]]
+    if args.kind in {"jani", "jiso", "biqua", "kitaev"}:
+        if not args.pair:
+            raise ValueError(f"--pair is required for --kind {args.kind}")
+        pairs = parse_pairs(args.pair, args.index_mode, mag, info.natoms)
+    if args.kind == "jani":
+        jobs, formulas = generate_jani(info, mag, pairs, out_root, args)
+    elif args.kind == "jiso":
+        jobs, formulas = generate_jiso(info, mag, pairs, out_root, args)
+    elif args.kind == "kitaev":
+        jobs, formulas = generate_kitaev(info, mag, pairs, out_root, args)
+    elif args.kind == "sia":
+        jobs, formulas = generate_sia(info, mag, out_root, args)
+    elif args.kind == "biqua":
+        jobs, formulas = generate_biqua(info, mag, pairs, out_root, args)
+    else:
+        raise ValueError(f"Unknown kind: {args.kind}")
+
+    write_jobs_tsv(out_root, jobs)
+    write_pair_indexing(out_root, pairs)
+    write_run_scripts(out_root, args.workflow)
+    write_postprocess_py(out_root)
+    write_metadata(out_root, args.kind, args.workflow, info, mag, args, formulas)
+    write_readme(out_root, args.kind, args.workflow, args)
+    print(f"[OK] Prepared {len(jobs)} state directories under {out_root}")
+    print(f"[OK] Next: cd {out_root} && bash submit_all.sh")
+
+
+def parse_vaspkit_sequence(raw: str) -> str:
+    parts = [part.strip() for part in re.split(r"[,;\s]+", raw) if part.strip()]
+    return "\n".join(parts) + "\n"
+
+
+def extract_rwig_values(potcar: Path) -> list[str]:
+    text = potcar.read_text(errors="ignore")
+    values = re.findall(r"RWIGS\s*=\s*([-+]?\d+(?:\.\d+)?)", text)
+    return values
+
+
+def update_bootstrap_incar(out_dir: Path, info: PoscarInfo, use_ldau: bool) -> None:
+    incar = out_dir / "INCAR"
+    tags: dict[str, str] = {}
+    potcar = out_dir / "POTCAR"
+    if potcar.exists():
+        rwigs = extract_rwig_values(potcar)
+        if rwigs:
+            tags["RWIGS"] = " ".join(rwigs[: len(info.elements)])
+    if use_ldau:
+        ldaul = []
+        ldauu = []
+        for elem in info.elements:
+            if elem in DEFAULT_U:
+                ldaul.append("2")
+                ldauu.append(str(DEFAULT_U[elem]))
+            else:
+                ldaul.append("-1")
+                ldauu.append("0")
+        tags["LDAU"] = ".TRUE."
+        tags["LDAUTYPE"] = "2"
+        tags["LDAUL"] = " ".join(ldaul)
+        tags["LDAUU"] = " ".join(ldauu)
+    if tags:
+        set_incar_tags(incar, tags)
+
+
+def bootstrap(args: argparse.Namespace) -> None:
+    poscar = Path(args.poscar).resolve()
+    info = read_poscar(poscar)
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(poscar, out_dir / "POSCAR")
+    sequence = parse_vaspkit_sequence(args.vaspkit_sequence)
+    print(f"[INFO] Running {args.vaspkit_command} in {out_dir}")
+    subprocess.run([args.vaspkit_command], input=sequence, cwd=out_dir, text=True, check=True)
+    update_bootstrap_incar(out_dir, info, not args.no_ldau)
+    missing = [name for name in REQUIRED_INPUTS if not (out_dir / name).exists()]
+    if missing:
+        print(f"[WARN] vaspkit finished but missing: {', '.join(missing)}", file=sys.stderr)
+    else:
+        print(f"[OK] Bootstrapped inputs in {out_dir}")
+
+
+def collect(args: argparse.Namespace) -> None:
+    root = Path(args.root).resolve()
+    namespace: dict[str, object] = {"__name__": "__postprocess__"}
+    exec(POSTPROCESS_PY, namespace)
+    cwd = Path.cwd()
+    os.chdir(root)
+    try:
+        namespace["main"]()
+    finally:
+        os.chdir(cwd)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Prepare VASP four-state magnetic calculations and analyze magnetic-neighbor geometry.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Examples:
+              python3 four_state_vasp.py neighbors --poscar POSCAR --magnetic-elements Cr --cutoff 10
+              python3 four_state_vasp.py prepare --kind jani --poscar POSCAR --input-dir inputs --out pair_14_15 --magnetic-elements Cr --pair 14-15 --moment 6 --workflow pbe-hse
+              python3 four_state_vasp.py prepare --kind sia --poscar POSCAR --input-dir inputs --out sia_Cr14 --magnetic-elements Cr --atom 14 --moment 6
+              python3 four_state_vasp.py prepare --kind kitaev --poscar POSCAR --input-dir inputs --out kitaev_14_15 --magnetic-elements Cr --ligand-elements I --pair 14-15
+              python3 four_state_vasp.py bootstrap --poscar POSCAR --out inputs --vaspkit-sequence "1 102 2 0.04"
+            """
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    neigh = sub.add_parser("neighbors", help="Analyze magnetic-pair neighbor shells and representative pairs")
+    neigh.add_argument("--poscar", required=True, help="POSCAR path")
+    neigh.add_argument("--magnetic-elements", nargs="+", help="Magnetic element symbols, e.g. Cr")
+    neigh.add_argument("--cutoff", type=float, default=10.0, help="Magnetic-pair cutoff in Angstrom")
+    neigh.add_argument("--shell-tol", type=float, default=0.08, help="Distance tolerance for shell grouping in Angstrom")
+    neigh.add_argument("--center-atom", type=int, help="Preferred center atom for representative shell checks")
+    neigh.add_argument("--index-mode", choices=["global", "magnetic"], default="global")
+    neigh.add_argument("--boundary-margin", type=float, default=0.5, help="Extra Angstrom margin for expansion heuristic")
+    neigh.add_argument("--max-rows", type=int, default=300, help="Maximum contact rows to print to stdout")
+    neigh.add_argument("--out", help="Optional directory for neighbor TSV outputs")
+    neigh.set_defaults(func=neighbors)
+
+    prep = sub.add_parser("prepare", help="Generate four-state input directories")
+    prep.add_argument("--kind", choices=["jani", "jiso", "sia", "biqua", "kitaev"], required=True)
+    prep.add_argument("--poscar", required=True, help="POSCAR path")
+    prep.add_argument("--input-dir", required=True, help="Directory containing INCAR/KPOINTS/POTCAR/POSCAR templates")
+    prep.add_argument("--pbe-input-dir", help="PBE+U template directory for --workflow pbe-hse")
+    prep.add_argument("--hse-input-dir", help="HSE no-U template directory for --workflow pbe-hse")
+    prep.add_argument("--out", required=True, help="Output calculation root")
+    prep.add_argument("--magnetic-elements", nargs="+", help="Magnetic element symbols, e.g. Cr")
+    prep.add_argument("--ligand-elements", nargs="+", help="Ligand element symbols for Kitaev octahedral-axis detection, e.g. I")
+    prep.add_argument("--pair", action="append", help="Pair I-J. Repeat or comma-separate for multiple pairs.")
+    prep.add_argument("--atom", type=int, help="Target atom for SIA")
+    prep.add_argument("--index-mode", choices=["global", "magnetic"], default="global")
+    prep.add_argument("--moment", type=float, default=6.0)
+    prep.add_argument(
+        "--background-axis",
+        choices=["x", "y", "z"],
+        help="Background spin axis. Defaults by kind: jiso=x, jani/biqua=z; SIA uses component defaults.",
+    )
+    prep.add_argument("--pair-axis", choices=["x", "y", "z"], default="z", help="Pair spin axis for Jiso")
+    prep.add_argument("--metal-ligand-cutoff", type=float, default=4.5, help="Metal-ligand cutoff for Kitaev shared-ligand detection")
+    prep.add_argument("--kitaev-pair-cutoff", type=float, default=10.0, help="Maximum metal-metal pair distance for Kitaev detection")
+    prep.add_argument(
+        "--kitaev-no-component-permutation",
+        action="store_true",
+        help="Match ideal Kitaev axes by row order/sign only, reproducing older generated_materials axis1.py behavior",
+    )
+    prep.add_argument("--workflow", choices=["single", "pbe-hse"], default="single")
+    prep.add_argument("--saxis", nargs=3, help="Optional SAXIS values, e.g. --saxis 0 0 1")
+    prep.add_argument("--no-stage-tag-edits", action="store_true", help="Do not add PBE/HSE stage INCAR tag edits")
+    prep.add_argument("--force", action="store_true", help="Allow writing into a non-empty output directory")
+    prep.set_defaults(func=prepare)
+
+    boot = sub.add_parser("bootstrap", help="Run vaspkit to create a reusable input template directory")
+    boot.add_argument("--poscar", required=True)
+    boot.add_argument("--out", required=True)
+    boot.add_argument("--vaspkit-command", default="vaspkit")
+    boot.add_argument("--vaspkit-sequence", default="1 102 2 0.04")
+    boot.add_argument("--no-ldau", action="store_true", help="Do not apply default LDAU tags after vaspkit")
+    boot.set_defaults(func=bootstrap)
+
+    coll = sub.add_parser("collect", help="Collect energies using metadata.json")
+    coll.add_argument("--root", required=True)
+    coll.set_defaults(func=collect)
+
+    krep = sub.add_parser("kitaev-report", help="Detect a Kitaev frame and optionally rotate a Jani tensor into it")
+    krep.add_argument("--poscar", required=True)
+    krep.add_argument("--magnetic-elements", nargs="+", help="Magnetic element symbols, e.g. Cr")
+    krep.add_argument("--ligand-elements", nargs="+", help="Ligand element symbols, e.g. I")
+    krep.add_argument("--pair", action="append", required=True, help="Exactly one pair I-J")
+    krep.add_argument("--index-mode", choices=["global", "magnetic"], default="global")
+    krep.add_argument("--metal-ligand-cutoff", type=float, default=4.5)
+    krep.add_argument("--kitaev-pair-cutoff", type=float, default=10.0)
+    krep.add_argument(
+        "--kitaev-no-component-permutation",
+        action="store_true",
+        help="Match ideal Kitaev axes by row order/sign only, reproducing older generated_materials axis1.py behavior",
+    )
+    krep.add_argument("--jani-root", help="Root of a completed Jani calculation with final_summary.txt")
+    krep.add_argument("--stage", help="Stage name in final_summary.txt, e.g. single or hse_no_u")
+    krep.add_argument("--out", help="Optional report file")
+    krep.set_defaults(func=kitaev_report)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

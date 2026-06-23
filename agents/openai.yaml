@@ -1,0 +1,4 @@
+interface:
+  display_name: "Four-State VASP"
+  short_description: "Analyze magnetic neighbors, Kitaev axes, and VASP four-state jobs."
+  default_prompt: "Use $four-state-vasp to analyze POSCAR magnetic-neighbor shells, choose representative pairs, warn about supercell boundaries, detect generated_materials-style Kitaev axes from octahedral ligands, and generate Jani, Jiso, SIA, biquadratic, or Kitaev VASP four-state jobs."
