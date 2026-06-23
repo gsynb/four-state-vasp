@@ -20,6 +20,45 @@ sys.modules[SPEC.name] = fsv
 SPEC.loader.exec_module(fsv)
 
 
+def write_mock_vasp_state(
+    root: Path,
+    rel: str,
+    energy: float,
+    m_constr: str,
+    mw_rows: list[tuple[float, float, float]] | None = None,
+    m_rows: list[tuple[float, float, float]] | None = None,
+    lambda_mw_perp_rows: list[tuple[float, float, float]] | None = None,
+    include_ep: bool = True,
+    include_lambda: bool = True,
+    include_mw: bool = True,
+    include_lambda_mw_perp: bool = True,
+) -> None:
+    state = root / rel
+    state.mkdir(parents=True)
+    state.joinpath("INCAR").write_text(f"LAMBDA = 10\nM_CONSTR = {m_constr}\n")
+    lines = [f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n"]
+    if include_ep:
+        lines.append("E_p = 0.0\n")
+    if include_lambda:
+        lines.append("lambda = 10\n")
+    rows = mw_rows or []
+    if include_mw:
+        m_rows = m_rows or rows
+        lines.append("ion        MW_int                 M_int\n")
+        for ion, (mw, m_int) in enumerate(zip(rows, m_rows), start=1):
+            lines.append(
+                f"{ion:3d} "
+                f"{mw[0]: .8f} {mw[1]: .8f} {mw[2]: .8f} "
+                f"{m_int[0]: .8f} {m_int[1]: .8f} {m_int[2]: .8f}\n"
+            )
+    if include_lambda_mw_perp:
+        lambda_rows = lambda_mw_perp_rows or [(0.0, 0.0, 0.0) for _ in rows]
+        lines.append("ion             lambda*MW_perp\n")
+        for ion, vec in enumerate(lambda_rows, start=1):
+            lines.append(f"{ion:3d} {vec[0]: .8f} {vec[1]: .8f} {vec[2]: .8f}\n")
+    state.joinpath("OSZICAR.single").write_text("".join(lines))
+
+
 class CoreFormulaAndGeometryTests(unittest.TestCase):
     def test_sia_diagonal_denominators_are_not_four(self):
         args = SimpleNamespace(spin_convention="unit_vector")
@@ -143,11 +182,33 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a unique explicit pair"):
             fsv.validate_pair_bond_context("jani", pair, bond, args)
 
-    def test_postprocess_writes_constraint_diagnostics_and_enforces_failures(self):
+    def test_non_nearest_pair_image_shift_is_rejected_by_default(self):
+        info = fsv.PoscarInfo(
+            path=Path("POSCAR"),
+            elements=["Cr"],
+            counts=[2],
+            atom_symbols=["Cr", "Cr"],
+            lattice=[(10.0, 0.0, 0.0), (0.0, 10.0, 0.0), (0.0, 0.0, 10.0)],
+            frac_coords=[(0.0, 0.0, 0.0), (0.2, 0.0, 0.0)],
+        )
+        pair = fsv.PairInfo(1, 2, 0, 1, 1, 2)
+        args = SimpleNamespace(pair_image_shift=(1, 0, 0), bond_distance_tol=1e-8, allow_periodic_bond_sum=False)
+        with self.assertRaisesRegex(ValueError, "not the nearest image"):
+            fsv.pair_bond_context(info, pair, args)
+
+    def test_constraint_mode_version_guard(self):
+        self.assertEqual(fsv.version_tuple("vasp.6.4.1"), (6, 4, 1))
+        fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=4, vasp_version="6.4.0"))
+        fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=1, vasp_version="6.3.2"))
+        with self.assertRaisesRegex(ValueError, "requires VASP >= 6.4.0"):
+            fsv.validate_constraint_mode(SimpleNamespace(constraint_mode=4, vasp_version="6.3.2"))
+
+    def test_postprocess_parses_vasp_tables_and_checks_background_moments(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             metadata = {
                 "kind": "jiso",
+                "constraint_mode": 4,
                 "stages": [{"name": "single", "base": "", "suffix": "single"}],
                 "formulas": [
                     {
@@ -165,18 +226,15 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
             (root / "metadata.json").write_text(json.dumps(metadata))
             (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
             energies = [-10.0, -11.0, -12.0, -13.0]
+            good_mw = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)]
+            bad_background_mw = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
             for idx, energy in enumerate(energies, start=1):
-                state = root / f"s{idx}"
-                state.mkdir()
-                state.joinpath("INCAR").write_text("LAMBDA = 10\nM_CONSTR = 1 0 0 0 1 0\n")
-                state.joinpath("OSZICAR.single").write_text(f" 1 F= {energy:.8f} E0= {energy:.8f} d E =0\n")
-                measured = "0 1 0 0 1 0" if idx == 4 else "1 0 0 0 1 0"
-                state.joinpath("OUTCAR.single").write_text(
-                    "E_p = 0.0\n"
-                    "lambda = 10\n"
-                    "lambda * MW_perp = 0.0\n"
-                    "MW_int = 1 0 0 0 1 0\n"
-                    f"M_int = {measured}\n"
+                write_mock_vasp_state(
+                    root,
+                    f"s{idx}",
+                    energy,
+                    "1 0 0 0 1 0 0 0 1",
+                    bad_background_mw if idx == 4 else good_mw,
                 )
 
             failed = subprocess.run(
@@ -190,6 +248,7 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
             diagnostics = root / "results" / "constraint_diagnostics.tsv"
             self.assertTrue(diagnostics.exists())
             diag_text = diagnostics.read_text()
+            self.assertIn("1,2,3", diag_text)
             self.assertIn("angle>5", diag_text)
             self.assertIn("False", diag_text)
             self.assertFalse((root / "final_summary.txt").exists())
@@ -206,6 +265,131 @@ class CoreFormulaAndGeometryTests(unittest.TestCase):
             )
             self.assertEqual(relaxed.returncode, 0, relaxed.stderr)
             self.assertIn("Jzz_meV", (root / "final_summary.txt").read_text())
+
+    def test_postprocess_fails_on_signed_flip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata = {
+                "kind": "jiso",
+                "constraint_mode": 1,
+                "stages": [{"name": "single", "base": "", "suffix": "single"}],
+                "formulas": [
+                    {
+                        "kind": "jiso",
+                        "label": "Jzz",
+                        "quantity": "Jzz_meV",
+                        "states": ["s1", "s2", "s3", "s4"],
+                        "state_labels": ["upup", "updn", "dnup", "dndn"],
+                        "energy_denominator": 4.0,
+                        "hamiltonian_prefactor": 1.0,
+                        "target_global_indices_1based": [1],
+                    }
+                ],
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata))
+            (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
+            for idx, energy in enumerate([-1.0, -2.0, -3.0, -4.0], start=1):
+                mw = [(0.0, 0.0, -1.0)] if idx == 1 else [(0.0, 0.0, 1.0)]
+                write_mock_vasp_state(root, f"s{idx}", energy, "0 0 1", mw)
+
+            failed = subprocess.run(
+                [sys.executable, "postprocess.py"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            diag_text = (root / "results" / "constraint_diagnostics.tsv").read_text()
+            self.assertIn("spin_sign_flip_ions=1", diag_text)
+            self.assertIn("180", diag_text)
+            self.assertFalse((root / "final_summary.txt").exists())
+
+    def test_postprocess_fails_when_formula_target_is_not_constrained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata = {
+                "kind": "jiso",
+                "constraint_mode": 4,
+                "stages": [{"name": "single", "base": "", "suffix": "single"}],
+                "formulas": [
+                    {
+                        "kind": "jiso",
+                        "label": "Jzz",
+                        "quantity": "Jzz_meV",
+                        "states": ["s1", "s2", "s3", "s4"],
+                        "state_labels": ["upup", "updn", "dnup", "dndn"],
+                        "energy_denominator": 4.0,
+                        "hamiltonian_prefactor": 1.0,
+                        "target_global_indices_1based": [2],
+                    }
+                ],
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata))
+            (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
+            rows = [(0.0, 0.0, 1.0), (0.0, 1.0, 0.0)]
+            for idx, energy in enumerate([-1.0, -2.0, -3.0, -4.0], start=1):
+                write_mock_vasp_state(root, f"s{idx}", energy, "0 0 1 0 0 0", rows)
+
+            failed = subprocess.run(
+                [sys.executable, "postprocess.py"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            diag_text = (root / "results" / "constraint_diagnostics.tsv").read_text()
+            self.assertIn("target_M_CONSTR_zero_ions=2", diag_text)
+            self.assertFalse((root / "final_summary.txt").exists())
+
+    def test_postprocess_fails_closed_when_constraint_data_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metadata = {
+                "kind": "jiso",
+                "constraint_mode": 4,
+                "stages": [{"name": "single", "base": "", "suffix": "single"}],
+                "formulas": [
+                    {
+                        "kind": "jiso",
+                        "label": "Jzz",
+                        "quantity": "Jzz_meV",
+                        "states": ["s1", "s2", "s3", "s4"],
+                        "state_labels": ["upup", "updn", "dnup", "dndn"],
+                        "energy_denominator": 4.0,
+                        "hamiltonian_prefactor": 1.0,
+                        "target_global_indices_1based": [1],
+                    }
+                ],
+            }
+            (root / "metadata.json").write_text(json.dumps(metadata))
+            (root / "postprocess.py").write_text(fsv.POSTPROCESS_PY)
+            for idx, energy in enumerate([-1.0, -2.0, -3.0, -4.0], start=1):
+                write_mock_vasp_state(
+                    root,
+                    f"s{idx}",
+                    energy,
+                    "0 0 1",
+                    include_ep=False,
+                    include_lambda=False,
+                    include_mw=False,
+                    include_lambda_mw_perp=False,
+                )
+
+            failed = subprocess.run(
+                [sys.executable, "postprocess.py"],
+                cwd=root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            diag_text = (root / "results" / "constraint_diagnostics.tsv").read_text()
+            self.assertIn("E_p_missing", diag_text)
+            self.assertIn("lambda_missing", diag_text)
+            self.assertIn("MW_int_missing", diag_text)
+            self.assertFalse((root / "final_summary.txt").exists())
 
     def test_physical_kitaev_decomposition_ignores_local_gauge_rotation(self):
         theta = math.radians(37.0)

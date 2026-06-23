@@ -142,9 +142,13 @@ For the default unit-vector convention, `J_denominator = 2` and `B_denominator =
 
 ## Constraint Diagnostics
 
-`postprocess.py` writes `results/constraint_diagnostics.tsv` in addition to `final_summary.txt`. The table records each state's final energy, parsed penalty energy `E_p` when present, target-site `M_int`/`MW_int` vectors when present, target-angle deviation, lambda diagnostics, and `constraint_pass`.
+`postprocess.py` writes `results/constraint_diagnostics.tsv` in addition to `final_summary.txt`. The table records each state's final energy, parsed penalty energy `E_p`, all nonzero `M_CONSTR` ion indices, constrained-site and target-site `MW_int`/`M_int` vectors, signed `MW_int` angle deviations, `lambda`, `lambda*MW_perp` vectors, and `constraint_pass`.
 
-By default strict postprocessing refuses to write final interaction values if a known penalty or target-angle check fails. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV` and `FOUR_STATE_MAX_TARGET_ANGLE_DEG`; set `FOUR_STATE_STRICT_CONSTRAINTS=0` only for manual debugging. Missing diagnostics are reported in the table/messages because VASP output formatting differs by version and build.
+`MW_int` is the primary direction diagnostic because it is the smoothed integrated moment entering VASP's constrained-moment penalty functional. The angle check is signed: a measured moment along `-n` has a 180 degree error against target `+n` and fails.
+
+Strict postprocessing refuses to write final interaction values if any required constraint diagnostic is missing or fails: `E_p`, `MW_int`, `M_CONSTR`, target ion records, reported `lambda`, target sign, or angle threshold. Thresholds can be adjusted with `FOUR_STATE_MAX_PENALTY_EV` and `FOUR_STATE_MAX_TARGET_ANGLE_DEG`; set `FOUR_STATE_STRICT_CONSTRAINTS=0` only for manual debugging.
+
+`prepare` writes `I_CONSTRAINED_M=4` by default so VASP constrains both direction and sign. This mode is available in VASP 6.4.0 and newer. If an older VASP must be used, set `--constraint-mode 1` explicitly and treat it as a compatibility mode: VASP constrains only the axis, while postprocessing still rejects any observed `MW_int` sign flip.
 
 ## Indexing Caution
 
@@ -187,10 +191,10 @@ mp: -gamma_i, +gamma_j
 mm: -gamma_i, -gamma_j
 ```
 
-The direct result is:
+The direct result is a local-gauge projection:
 
 ```text
-J_gamma_gamma_meV = prefactor * (E_pp - E_pm - E_mp + E_mm) * 1000 / denominator
+local_gauge_J_gamma_i_gamma_j_meV = prefactor * (E_pp - E_pm - E_mp + E_mm) * 1000 / denominator
 ```
 
 For the default unit-vector convention, `denominator = 4` for a unique explicit pair. With `--spin-convention spin_S`, this is additionally scaled by `S^2`.

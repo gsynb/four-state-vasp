@@ -90,6 +90,8 @@ class PairInfo:
 class PairBondContext:
     image_shift: tuple[int, int, int]
     distance: float
+    nearest_image_shift: tuple[int, int, int]
+    nearest_distance: float
     multiplicity: int
     equivalent_shifts: list[tuple[int, int, int]]
 
@@ -499,14 +501,23 @@ def pair_distance_for_shift(info: PoscarInfo, pair: PairInfo, shift: tuple[int, 
 
 def pair_bond_context(info: PoscarInfo, pair: PairInfo, args: argparse.Namespace) -> PairBondContext:
     requested_shift = tuple(getattr(args, "pair_image_shift", None) or ())
+    nearest_shift, _, _, nearest_distance = nearest_pair_image(info, pair)
     if requested_shift:
         if len(requested_shift) != 3:
             raise ValueError("--pair-image-shift requires exactly three integers")
         image_shift = requested_shift  # type: ignore[assignment]
         distance = pair_distance_for_shift(info, pair, image_shift)
     else:
-        image_shift, _, _, distance = nearest_pair_image(info, pair)
+        image_shift = nearest_shift
+        distance = nearest_distance
     tol = getattr(args, "bond_distance_tol", 0.02)
+    if requested_shift and distance > nearest_distance + tol and not getattr(args, "allow_periodic_bond_sum", False):
+        raise ValueError(
+            f"--pair-image-shift {format_shift(image_shift)} is not the nearest image for {pair.label}; "
+            f"nearest is {format_shift(nearest_shift)} at {nearest_distance:.6f} A. Four-state MAGMOM/M_CONSTR "
+            "selects POSCAR atom indices, not a specific farther periodic image. Use the nearest explicit pair "
+            "or enable --allow-periodic-bond-sum only for exploratory summed/geometry analysis."
+        )
     extent = translation_search_extent(info, distance + tol + 0.5)
     equivalent_shifts: list[tuple[int, int, int]] = []
     for tx in range(-extent, extent + 1):
@@ -522,6 +533,8 @@ def pair_bond_context(info: PoscarInfo, pair: PairInfo, args: argparse.Namespace
     return PairBondContext(
         image_shift=image_shift,
         distance=distance,
+        nearest_image_shift=nearest_shift,
+        nearest_distance=nearest_distance,
         multiplicity=max(1, len(equivalent_shifts)),
         equivalent_shifts=equivalent_shifts,
     )
@@ -558,6 +571,8 @@ def bond_formula_metadata(bond: PairBondContext, args: argparse.Namespace) -> di
     return {
         "bond_multiplicity": bond.multiplicity,
         "pair_image_shift": bond.image_shift,
+        "nearest_pair_image_shift": bond.nearest_image_shift,
+        "nearest_pair_distance_A": bond.nearest_distance,
         "equivalent_pair_shifts": bond.equivalent_shifts,
         "pair_distance_A": bond.distance,
         "pair_extraction_note": note,
@@ -1181,6 +1196,13 @@ def detect_kitaev_frame(info: PoscarInfo, mag: list[int], pair: PairInfo, args: 
     for label, axis_i in kitaev_axes_i:
         angle = vec_angle_degrees(axis_i, axis_map_j[label])
         axis_consistency.append(min(angle, 180.0 - angle))
+    max_axis_consistency = getattr(args, "max_kitaev_axis_consistency_deg", 25.0)
+    if max_axis_consistency is not None and max(axis_consistency) > float(max_axis_consistency):
+        raise ValueError(
+            f"Kitaev local axes differ too much between the two sites: max axis consistency angle "
+            f"{max(axis_consistency):.3f} deg > --max-kitaev-axis-consistency-deg {float(max_axis_consistency):.3f}. "
+            "Use full Jani tensor reporting or inspect the octahedral geometry before compressing to a standard model."
+        )
     shared_summary = [(idx, shift, di, dj) for idx, shift, di, dj, _ in chosen]
     return KitaevFrame(
         pair=pair,
@@ -1640,6 +1662,42 @@ def validate_cli_saxis(args: argparse.Namespace) -> None:
         )
 
 
+def version_tuple(raw: str | None) -> tuple[int, int, int] | None:
+    if not raw:
+        return None
+    nums = [int(match) for match in re.findall(r"\d+", raw)[:3]]
+    if not nums:
+        return None
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums[:3])
+
+
+def validate_constraint_mode(args: argparse.Namespace) -> None:
+    mode = int(getattr(args, "constraint_mode", 4))
+    if mode not in {1, 2, 4}:
+        raise ValueError("--constraint-mode must be one of 1, 2, or 4")
+    parsed = version_tuple(getattr(args, "vasp_version", None))
+    if mode == 4 and parsed is not None and parsed < (6, 4, 0):
+        raise ValueError(
+            "--constraint-mode 4 requires VASP >= 6.4.0 because it constrains direction and sign. "
+            "Use a newer VASP for production four-state runs, or explicitly choose --constraint-mode 1/2 "
+            "and rely on strict signed MW_int diagnostics."
+        )
+    if mode == 1:
+        print(
+            "[WARN] I_CONSTRAINED_M=1 constrains only the axis, not the +/- sign; "
+            "postprocess will fail if MW_int flips sign.",
+            file=sys.stderr,
+        )
+    if mode == 2:
+        print(
+            "[WARN] I_CONSTRAINED_M=2 constrains direction and moment size; verify moment-length convergence "
+            "before using tiny energy differences.",
+            file=sys.stderr,
+        )
+
+
 def incar_bool(raw: str) -> bool | None:
     token = raw.strip().split()[0].strip(".").upper() if raw.strip() else ""
     if token in {"TRUE", "T", "1", "YES"}:
@@ -1724,7 +1782,7 @@ def common_incar_tags(magmom: str, args: argparse.Namespace) -> dict[str, str | 
         "MAGMOM": magmom,
         "M_CONSTR": magmom,
         "LNONCOLLINEAR": ".TRUE.",
-        "I_CONSTRAINED_M": "1",
+        "I_CONSTRAINED_M": str(int(getattr(args, "constraint_mode", 4))),
         "ISPIN": None,
         "NSW": "0",
         "IBRION": "-1",
@@ -1927,7 +1985,7 @@ def generate_kitaev(
             {
                 "label": f"{pair.label}_Kitaev_{frame.gamma_label}" if nest_pairs else f"Kitaev_{frame.gamma_label}",
                 "kind": "four_state",
-                "quantity": "J_gamma_gamma_meV",
+                "quantity": "local_gauge_J_gamma_i_gamma_j_meV",
                 "states": states,
                 "state_labels": spin_names,
                 "formula": f"prefactor * (E_pp - E_pm - E_mp + E_mm) * 1000 / {denominator:g}",
@@ -1935,7 +1993,7 @@ def generate_kitaev(
                 "hamiltonian_prefactor": hamiltonian_prefactor(args),
                 "target_global_indices_1based": [pair.global_i + 1, pair.global_j + 1],
                 **bond_formula_metadata(bond, args),
-                "note": "Projection along the octahedral gamma axis. Rotate full Jani with kitaev-report for K minus isotropic part.",
+                "note": "Direct Kitaev prepare constrains site-i gamma_i and site-j gamma_j, so this is a local-gauge projection gamma_i^T J gamma_j. Use full Jani plus kitaev-report common-frame decomposition for physical K/Gamma/DMI.",
             }
         )
     write_kitaev_frames(out_root, frames, info)
@@ -2203,12 +2261,12 @@ ENERGY_RE = re.compile(r"E0=\s*(" + FLOAT_RE_TEXT + r")")
 TOTEN_RE = re.compile(r"free\s+energy\s+TOTEN\s+=\s+(" + FLOAT_RE_TEXT + r")")
 PENALTY_RE = re.compile(r"\bE_p\s*=\s*(" + FLOAT_RE_TEXT + r")")
 LAMBDA_RE = re.compile(r"\blambda\s*=\s*(" + FLOAT_RE_TEXT + r")", re.I)
-LAMBDA_MW_PERP_RE = re.compile(r"lambda\s*\*\s*MW_perp\s*=\s*(" + FLOAT_RE_TEXT + r")", re.I)
-MW_INT_RE = re.compile(r"\bMW_int\s*=\s*([^\n\r]+)")
-M_INT_RE = re.compile(r"\bM_int\s*=\s*([^\n\r]+)")
+ION_MW_HEADER_RE = re.compile(r"^\s*ion\s+MW_int\s+M_int\s*$", re.I)
+ION_LAMBDA_MW_PERP_HEADER_RE = re.compile(r"^\s*ion\s+lambda\s*\*\s*MW_perp\s*$", re.I)
 MAX_PENALTY_EV = float(os.environ.get("FOUR_STATE_MAX_PENALTY_EV", "1e-4"))
 MAX_TARGET_ANGLE_DEG = float(os.environ.get("FOUR_STATE_MAX_TARGET_ANGLE_DEG", "5.0"))
 STRICT_CONSTRAINTS = os.environ.get("FOUR_STATE_STRICT_CONSTRAINTS", "1").strip().lower() not in {"0", "false", "no"}
+NONZERO_MCONSTR_TOL = 1e-8
 
 def parse_float(raw: str) -> float:
     return float(raw.replace("D", "E").replace("d", "e"))
@@ -2219,12 +2277,15 @@ def parse_floats(raw: str) -> list[float]:
 def vector_norm(vec) -> float:
     return math.sqrt(sum(value * value for value in vec))
 
+def vector_dot(a, b) -> float:
+    return sum(a[idx] * b[idx] for idx in range(3))
+
 def vector_angle_degrees(a, b) -> float | None:
     na = vector_norm(a)
     nb = vector_norm(b)
     if na <= 1e-12 or nb <= 1e-12:
         return None
-    dot = sum(a[idx] * b[idx] for idx in range(3)) / (na * nb)
+    dot = vector_dot(a, b) / (na * nb)
     dot = max(-1.0, min(1.0, dot))
     return math.degrees(math.acos(dot))
 
@@ -2270,26 +2331,88 @@ def last_regex_float(texts: list[tuple[Path, str]], pattern: re.Pattern[str]) ->
             return parse_float(matches[-1])
     return None
 
-def last_vector_record(texts: list[tuple[Path, str]], pattern: re.Pattern[str]) -> list[tuple[float, float, float]]:
-    for _, text in reversed(texts):
-        matches = pattern.findall(text)
-        if matches:
-            vectors = as_vectors(parse_floats(matches[-1]))
-            if vectors:
-                return vectors
-    return []
+def parse_ion_moment_tables(text: str) -> list[tuple[dict[int, tuple[float, float, float]], dict[int, tuple[float, float, float]]]]:
+    tables = []
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        if not ION_MW_HEADER_RE.match(lines[idx]):
+            idx += 1
+            continue
+        idx += 1
+        mw_table: dict[int, tuple[float, float, float]] = {}
+        m_table: dict[int, tuple[float, float, float]] = {}
+        while idx < len(lines):
+            match = re.match(r"^\s*(\d+)\s+(.+?)\s*$", lines[idx])
+            if not match:
+                break
+            vals = parse_floats(match.group(2))
+            if len(vals) < 6:
+                break
+            ion = int(match.group(1))
+            mw_table[ion] = tuple(vals[0:3])
+            m_table[ion] = tuple(vals[3:6])
+            idx += 1
+        if mw_table:
+            tables.append((mw_table, m_table))
+    return tables
 
-def select_vectors(vectors: list[tuple[float, float, float]], indices_1based: list[int]) -> list[tuple[float, float, float]]:
-    if not vectors or not indices_1based:
-        return []
-    if max(indices_1based) <= len(vectors):
-        return [vectors[idx - 1] for idx in indices_1based]
-    return vectors[: len(indices_1based)]
+def parse_lambda_mw_perp_tables(text: str) -> list[dict[int, tuple[float, float, float]]]:
+    tables = []
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        if not ION_LAMBDA_MW_PERP_HEADER_RE.match(lines[idx]):
+            idx += 1
+            continue
+        idx += 1
+        table: dict[int, tuple[float, float, float]] = {}
+        while idx < len(lines):
+            match = re.match(r"^\s*(\d+)\s+(.+?)\s*$", lines[idx])
+            if not match:
+                break
+            vals = parse_floats(match.group(2))
+            if len(vals) < 3:
+                break
+            ion = int(match.group(1))
+            table[ion] = tuple(vals[0:3])
+            idx += 1
+        if table:
+            tables.append(table)
+    return tables
+
+def last_ion_moment_table(texts: list[tuple[Path, str]]) -> tuple[dict[int, tuple[float, float, float]], dict[int, tuple[float, float, float]]]:
+    for _, text in reversed(texts):
+        tables = parse_ion_moment_tables(text)
+        if tables:
+            return tables[-1]
+    return {}, {}
+
+def last_lambda_mw_perp_table(texts: list[tuple[Path, str]]) -> dict[int, tuple[float, float, float]]:
+    for _, text in reversed(texts):
+        tables = parse_lambda_mw_perp_tables(text)
+        if tables:
+            return tables[-1]
+    return {}
+
+def constrained_indices_from_mconstr(vectors: list[tuple[float, float, float]]) -> list[int]:
+    return [idx + 1 for idx, vec in enumerate(vectors) if vector_norm(vec) > NONZERO_MCONSTR_TOL]
+
+def vectors_for_indices(table: dict[int, tuple[float, float, float]], indices_1based: list[int]) -> list[tuple[float, float, float]]:
+    return [table[idx] for idx in indices_1based if idx in table]
 
 def format_vector_list(vectors: list[tuple[float, float, float]]) -> str:
     if not vectors:
         return "NA"
     return ";".join("(" + ",".join(f"{value:.8f}" for value in vec) + ")" for vec in vectors)
+
+def format_index_list(indices: list[int]) -> str:
+    return ",".join(str(idx) for idx in indices) if indices else "NA"
+
+def max_norm(vectors: list[tuple[float, float, float]]) -> float | None:
+    if not vectors:
+        return None
+    return max(vector_norm(vec) for vec in vectors)
 
 def extract_energy(path: Path, suffix: str) -> float:
     for cand, text in read_text_candidates(path, suffix):
@@ -2301,54 +2424,125 @@ def extract_energy(path: Path, suffix: str) -> float:
             return parse_float(matches[-1])
     raise FileNotFoundError(f"No energy found in {path} for suffix {suffix}")
 
-def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state_label: str, stage_name: str) -> dict:
+def extract_state_record(base: Path, rel: str, suffix: str, formula: dict, state_label: str, stage_name: str, metadata: dict) -> dict:
     path = base / rel
     texts = read_text_candidates(path, suffix)
     energy = extract_energy(path, suffix)
     penalty_ep = last_regex_float(texts, PENALTY_RE)
-    lambda_value = last_regex_float(texts, LAMBDA_RE)
-    if lambda_value is None:
-        incar_lambda = read_incar_tag(path / "INCAR", "LAMBDA")
-        values = parse_floats(incar_lambda or "")
-        lambda_value = max(values) if values else None
-    lambda_mw_perp = last_regex_float(texts, LAMBDA_MW_PERP_RE)
-    mw_vectors = last_vector_record(texts, MW_INT_RE)
-    m_vectors = last_vector_record(texts, M_INT_RE)
-    target_vectors = as_vectors(parse_floats(read_incar_tag(path / "INCAR", "M_CONSTR") or ""))
-    target_indices = [int(idx) for idx in formula.get("target_global_indices_1based", [])]
-    target_mw = select_vectors(mw_vectors, target_indices)
-    target_m = select_vectors(m_vectors, target_indices)
-    target_ref = select_vectors(target_vectors, target_indices)
-    angles = []
-    for target, measured in zip(target_ref, target_m):
-        angle = vector_angle_degrees(target, measured)
-        if angle is not None:
-            angles.append(min(angle, 180.0 - angle))
-    max_angle = max(angles) if angles else None
+    reported_lambda = last_regex_float(texts, LAMBDA_RE)
+    incar_lambda = read_incar_tag(path / "INCAR", "LAMBDA")
+    incar_lambda_values = parse_floats(incar_lambda or "")
+    lambda_value = reported_lambda if reported_lambda is not None else (max(incar_lambda_values) if incar_lambda_values else None)
+    mw_table, m_table = last_ion_moment_table(texts)
+    lambda_mw_perp_table = last_lambda_mw_perp_table(texts)
+    m_constr_raw = read_incar_tag(path / "INCAR", "M_CONSTR")
+    target_vectors = as_vectors(parse_floats(m_constr_raw or ""))
+    constrained_indices = constrained_indices_from_mconstr(target_vectors)
+    formula_target_indices = [int(idx) for idx in formula.get("target_global_indices_1based", [])]
+    target_indices = formula_target_indices or constrained_indices
+    constrained_refs = [target_vectors[idx - 1] for idx in constrained_indices if idx <= len(target_vectors)]
+    constrained_mw = vectors_for_indices(mw_table, constrained_indices)
+    target_mw = vectors_for_indices(mw_table, target_indices)
+    constrained_m = vectors_for_indices(m_table, constrained_indices)
+    target_m = vectors_for_indices(m_table, target_indices)
+    constrained_lambda_mw_perp = vectors_for_indices(lambda_mw_perp_table, constrained_indices)
+    target_lambda_mw_perp = vectors_for_indices(lambda_mw_perp_table, target_indices)
+    constrained_angles = []
+    target_angles = []
+    zero_mw_indices = []
+    sign_flip_indices = []
+    for idx, ref in zip(constrained_indices, constrained_refs):
+        measured = mw_table.get(idx)
+        if measured is None:
+            continue
+        angle = vector_angle_degrees(ref, measured)
+        if angle is None:
+            zero_mw_indices.append(idx)
+            continue
+        constrained_angles.append(angle)
+        if idx in target_indices:
+            target_angles.append(angle)
+        if vector_dot(ref, measured) < 0.0:
+            sign_flip_indices.append(idx)
+    max_constrained_angle = max(constrained_angles) if constrained_angles else None
+    max_target_angle = max(target_angles) if target_angles else None
+    missing_mw_indices = [idx for idx in constrained_indices if idx not in mw_table]
+    missing_target_vector_indices = [idx for idx in target_indices if idx > len(target_vectors)]
+    unconstrained_target_indices = [
+        idx
+        for idx in target_indices
+        if idx <= len(target_vectors) and vector_norm(target_vectors[idx - 1]) <= NONZERO_MCONSTR_TOL
+    ]
+    missing_target_mw_indices = [idx for idx in target_indices if idx not in mw_table]
     messages = []
     passed = True
+
+    def fail(message: str) -> None:
+        nonlocal passed
+        passed = False
+        messages.append(message)
+
+    def note(message: str) -> None:
+        messages.append(message)
+
     if penalty_ep is None:
-        messages.append("E_p_missing")
+        fail("E_p_missing")
     elif abs(penalty_ep) > MAX_PENALTY_EV:
-        passed = False
-        messages.append(f"E_p>{MAX_PENALTY_EV:g}")
-    if max_angle is None:
-        messages.append("target_angle_unavailable")
-    elif max_angle > MAX_TARGET_ANGLE_DEG:
-        passed = False
-        messages.append(f"angle>{MAX_TARGET_ANGLE_DEG:g}")
+        fail(f"E_p>{MAX_PENALTY_EV:g}")
+    if reported_lambda is None:
+        fail("lambda_missing")
+    if m_constr_raw is None:
+        fail("M_CONSTR_missing")
+    elif not target_vectors:
+        fail("M_CONSTR_empty_or_unparsed")
+    elif not constrained_indices:
+        fail("M_CONSTR_has_no_nonzero_vectors")
+    if missing_target_vector_indices:
+        fail("target_M_CONSTR_missing_ions=" + format_index_list(missing_target_vector_indices))
+    if unconstrained_target_indices:
+        fail("target_M_CONSTR_zero_ions=" + format_index_list(unconstrained_target_indices))
+    if not mw_table:
+        fail("MW_int_missing")
+    elif missing_mw_indices:
+        fail("MW_int_missing_ions=" + format_index_list(missing_mw_indices))
+    elif missing_target_mw_indices:
+        fail("target_MW_int_missing_ions=" + format_index_list(missing_target_mw_indices))
+    if zero_mw_indices:
+        fail("MW_int_zero_ions=" + format_index_list(zero_mw_indices))
+    if sign_flip_indices:
+        fail("spin_sign_flip_ions=" + format_index_list(sign_flip_indices))
+    if max_constrained_angle is None:
+        if mw_table and constrained_indices and not missing_mw_indices:
+            fail("constraint_angle_unavailable")
+    elif max_constrained_angle > MAX_TARGET_ANGLE_DEG:
+        fail(f"angle>{MAX_TARGET_ANGLE_DEG:g}")
+    if not m_table:
+        note("M_int_missing")
+    if not lambda_mw_perp_table:
+        note("lambda_MW_perp_missing")
+    if int(metadata.get("constraint_mode", 0) or 0) == 1:
+        note("constraint_mode_1_axis_only")
     return {
         "stage": stage_name,
         "formula_label": formula["label"],
         "state_label": state_label,
         "relpath": rel,
         "energy_eV": energy,
+        "constraint_mode": metadata.get("constraint_mode", "NA"),
         "penalty_Ep_eV": penalty_ep,
-        "max_target_angle_deg": max_angle,
+        "max_constrained_angle_deg": max_constrained_angle,
+        "max_target_angle_deg": max_target_angle,
+        "constrained_global_indices_1based": format_index_list(constrained_indices),
+        "target_global_indices_1based": format_index_list(target_indices),
+        "constrained_site_MW_int": format_vector_list(constrained_mw),
         "target_site_MW_int": format_vector_list(target_mw),
+        "constrained_site_M_int": format_vector_list(constrained_m),
         "target_site_M_int": format_vector_list(target_m),
         "lambda": lambda_value,
-        "lambda_MW_perp": lambda_mw_perp,
+        "max_lambda_MW_perp_norm": max_norm(constrained_lambda_mw_perp),
+        "lambda_MW_perp": max_norm(constrained_lambda_mw_perp),
+        "constrained_site_lambda_MW_perp": format_vector_list(constrained_lambda_mw_perp),
+        "target_site_lambda_MW_perp": format_vector_list(target_lambda_mw_perp),
         "constraint_pass": passed,
         "messages": ";".join(messages) if messages else "ok",
     }
@@ -2365,7 +2559,7 @@ def collect_stage(root: Path, metadata: dict, stage: dict) -> tuple[str, list[di
     for formula in metadata["formulas"]:
         state_labels = formula.get("state_labels", [f"E{idx + 1}" for idx in range(len(formula["states"]))])
         state_records = [
-            extract_state_record(base, rel, suffix, formula, label, stage["name"])
+            extract_state_record(base, rel, suffix, formula, label, stage["name"], metadata)
             for rel, label in zip(formula["states"], state_labels)
         ]
         diagnostics.extend(state_records)
@@ -2408,12 +2602,21 @@ def write_constraint_diagnostics(path: Path, rows: list[dict]) -> None:
         "state_label",
         "relpath",
         "energy_eV",
+        "constraint_mode",
         "penalty_Ep_eV",
+        "max_constrained_angle_deg",
         "max_target_angle_deg",
+        "constrained_global_indices_1based",
+        "target_global_indices_1based",
+        "constrained_site_MW_int",
         "target_site_MW_int",
+        "constrained_site_M_int",
         "target_site_M_int",
         "lambda",
+        "max_lambda_MW_perp_norm",
         "lambda_MW_perp",
+        "constrained_site_lambda_MW_perp",
+        "target_site_lambda_MW_perp",
         "constraint_pass",
         "messages",
     ]
@@ -2500,6 +2703,9 @@ def write_metadata(
         "spin_length_S": getattr(args, "spin_length_S", 1.0),
         "bond_distance_tol_A": getattr(args, "bond_distance_tol", 0.02),
         "requested_pair_image_shift": getattr(args, "pair_image_shift", None),
+        "constraint_mode": int(getattr(args, "constraint_mode", 4)),
+        "vasp_version": getattr(args, "vasp_version", None),
+        "max_kitaev_axis_consistency_deg": getattr(args, "max_kitaev_axis_consistency_deg", None),
         "background_axis_effective": effective_background_axis(kind, args),
         "pair_axis": args.pair_axis,
         "index_mode": args.index_mode,
@@ -2514,6 +2720,8 @@ def write_readme(out_root: Path, kind: str, workflow: str, args: argparse.Namesp
 kind = {kind}
 workflow = {workflow}
 moment = {args.moment}
+constraint_mode = {int(getattr(args, "constraint_mode", 4))}
+vasp_version = {getattr(args, "vasp_version", None)}
 background_axis = {effective_background_axis(kind, args)}
 pair_axis = {args.pair_axis}
 index_mode = {args.index_mode}
@@ -2547,6 +2755,7 @@ def prepare(args: argparse.Namespace) -> None:
     if out_root.exists() and any(out_root.iterdir()) and not args.force:
         raise FileExistsError(f"Output directory is not empty: {out_root}. Use --force to write into it.")
     validate_cli_saxis(args)
+    validate_constraint_mode(args)
     validate_input_templates(info, args)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -2689,6 +2898,14 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--index-mode", choices=["global", "magnetic"], default="global")
     prep.add_argument("--moment", type=float, default=6.0)
     prep.add_argument(
+        "--constraint-mode",
+        type=int,
+        choices=[1, 2, 4],
+        default=4,
+        help="VASP I_CONSTRAINED_M mode. Default 4 constrains direction and sign and requires VASP >= 6.4.0.",
+    )
+    prep.add_argument("--vasp-version", help="VASP version used for these jobs, e.g. 6.4.3; stored in metadata and checked for mode 4")
+    prep.add_argument(
         "--hamiltonian-sign",
         choices=["plus", "minus"],
         default="plus",
@@ -2736,6 +2953,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow nearest-ligand fallback if two shared ligands are not found within --metal-ligand-cutoff",
     )
+    prep.add_argument(
+        "--max-kitaev-axis-consistency-deg",
+        type=float,
+        default=25.0,
+        help="Reject Kitaev compression if matched local x/y/z axes differ by more than this angle between the two sites",
+    )
     prep.add_argument("--workflow", choices=["single", "pbe-hse"], default="single")
     prep.add_argument("--saxis", nargs=3, help="Optional SAXIS values; only the default 0 0 1 is currently supported")
     prep.add_argument("--no-stage-tag-edits", action="store_true", help="Do not add PBE/HSE stage INCAR tag edits")
@@ -2772,6 +2995,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-kitaev-ligand-fallback",
         action="store_true",
         help="Allow nearest-ligand fallback if two shared ligands are not found within --metal-ligand-cutoff",
+    )
+    krep.add_argument(
+        "--max-kitaev-axis-consistency-deg",
+        type=float,
+        default=25.0,
+        help="Reject common-frame model compression if matched local axes differ too much between the two sites",
     )
     krep.add_argument(
         "--pair-image-shift",

@@ -176,7 +176,8 @@ Do not commit licensed or large VASP files such as `POTCAR`, `WAVECAR`, or `CHGC
 - `--pair-image-shift` 只用于几何识别和报告，不能在能量上隔离某一条周期键。
 - 程序默认拒绝 `bond_multiplicity > 1` 的 pair。仅在探索性检查或你明确知道要拟合“周期键总和”时使用 `--allow-periodic-bond-sum`；此时分母仍不会除以 multiplicity。
 - 只支持默认 `SAXIS = 0 0 1`。非默认 `SAXIS` 会改变 VASP spinor basis，而本库生成的 `M_CONSTR` 是 Cartesian 方向；当前不会自动做两者转换。
-- 后处理会写出 `results/constraint_diagnostics.tsv`，包含 `E_p`、`M_int/MW_int`（若 VASP 输出中存在）、目标角偏差、`lambda` 和 `constraint_pass`。可用环境变量 `FOUR_STATE_MAX_PENALTY_EV`、`FOUR_STATE_MAX_TARGET_ANGLE_DEG` 和 `FOUR_STATE_STRICT_CONSTRAINTS=0` 调整阈值或关闭严格失败。
+- 默认使用 `I_CONSTRAINED_M=4`，因为四态法需要区分 `+n` 和 `-n`；该模式要求 VASP >= 6.4.0。老版本可显式使用 `--constraint-mode 1`，但后处理仍会用有符号 `MW_int` 夹角检查，反号会失败。
+- 后处理会写出 `results/constraint_diagnostics.tsv`，解析真实 VASP `ion MW_int M_int` 和 `ion lambda*MW_perp` 表格，检查所有非零 `M_CONSTR` 原子的 `MW_int` 方向、符号、`E_p` 和 `lambda`。严格模式下缺少 `E_p`、`MW_int`、`M_CONSTR`、目标原子记录或 `lambda` 会拒绝写出最终结果。可用环境变量 `FOUR_STATE_MAX_PENALTY_EV`、`FOUR_STATE_MAX_TARGET_ANGLE_DEG` 和 `FOUR_STATE_STRICT_CONSTRAINTS=0` 调整阈值或关闭严格失败。
 
 ## 命令行使用
 
@@ -466,10 +467,11 @@ Always inspect `pair_indexing.tsv`, `sia_target.tsv`, and `metadata.json` after 
 - Generated energies are reported in meV.
 - `--workflow pbe-hse` creates both PBE+U preconvergence and HSE no-U directories.
 - `kitaev-report` requires `--stage` when a `final_summary.txt` contains multiple stages such as `pbe_pre` and `hse_no_u`.
-- `prepare --kind kitaev` directly computes the selected `J_gamma_gamma` projection. For a more complete Kitaev anisotropy estimate, run full `jani` first and then `kitaev-report`.
+- `prepare --kind kitaev` directly computes `local_gauge_J_gamma_i_gamma_j_meV`, i.e. `gamma_i^T J gamma_j` using the two site-local axes. For a more complete Kitaev anisotropy estimate, run full `jani` first and then `kitaev-report`.
 - `jani`/`jiso`/`kitaev`/`biqua` reject non-unique periodic pair images by default. `--allow-periodic-bond-sum` reports the summed coupling over periodic translations and does not divide by multiplicity.
 - `kitaev-report` writes physical decompositions with the `physical_` prefix from a common bond frame; local-gauge matrices are diagnostics only.
-- `collect` writes `results/constraint_diagnostics.tsv`; inspect it before trusting small anisotropy or Kitaev values.
+- `prepare` writes `I_CONSTRAINED_M=4` by default and records `constraint_mode` plus optional `--vasp-version` in `metadata.json`. Use VASP >= 6.4.0 for production sign-constrained four-state calculations.
+- `collect` writes `results/constraint_diagnostics.tsv`; it parses VASP-style `MW_int/M_int` and `lambda*MW_perp` tables, checks every nonzero `M_CONSTR` site with a signed `MW_int` angle, and fails closed in strict mode.
 - The methods and state formulas are documented in `references/methods.md`.
 
 ## Literature / 文献引用
@@ -480,3 +482,4 @@ If you publish results generated with this workflow, cite the papers that match 
 - Energy-mapping review: H. Xiang, C. Lee, H.-J. Koo, X. G. Gong, and M.-H. Whangbo, Dalton Trans. 42, 823-853 (2013), DOI: [10.1039/C2DT31662E](https://doi.org/10.1039/C2DT31662E).
 - Generic four-state mapping reference: D. Sabani, C. Bacaksiz, and M. V. Milosevic, Phys. Rev. B 102, 014457 (2020), DOI: [10.1103/PhysRevB.102.014457](https://doi.org/10.1103/PhysRevB.102.014457).
 - Kitaev model/local-axis context: A. Kitaev, Ann. Phys. 321, 2-111 (2006), DOI: [10.1016/j.aop.2005.10.005](https://doi.org/10.1016/j.aop.2005.10.005).
+- VASP constrained moments: [I_CONSTRAINED_M](https://vasp.at/wiki/index.php/I_CONSTRAINED_M) and [M_CONSTR](https://www.vasp.at/wiki/index.php/M_CONSTR).
